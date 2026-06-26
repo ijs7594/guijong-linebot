@@ -1,0 +1,16 @@
+{
+  "name": "guijong-linebot",
+  "version": "1.0.0",
+  "description": "貴焿古早味麵線羹 LINE 機器人",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
