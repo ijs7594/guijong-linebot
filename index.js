@@ -167,7 +167,11 @@ app.post('/webhook', async (req, res) => {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
 
     const userId = event.source.userId;
-    const userText = event.message.text.trim();
+    // 全形轉半形數字，再 trim
+    const userText = event.message.text.trim().replace(/[１２３４５６７８９０]/g, s =>
+      String.fromCharCode(s.charCodeAt(0) - 0xFEE0)
+    );
+    console.log(`[userId=${userId}] 收到訊息: "${userText}"`);
     const replyToken = event.replyToken;
 
     // 初始化 session
@@ -199,12 +203,18 @@ app.post('/webhook', async (req, res) => {
 
       // 技能開場
       const skill = SKILLS[session.skill];
-      const opening = await callClaude(skill.prompt, [], '請開始');
-      session.history = [
-        { role: 'user', content: '請開始' },
-        { role: 'assistant', content: opening }
-      ];
-      await replyToLine(replyToken, opening);
+      try {
+        const opening = await callClaude(skill.prompt, [], '請開始');
+        session.history = [
+          { role: 'user', content: '請開始' },
+          { role: 'assistant', content: opening }
+        ];
+        await replyToLine(replyToken, opening);
+      } catch (err) {
+        console.error('技能開場失敗:', err);
+        session.skill = null;
+        await replyToLine(replyToken, '抱歉，啟動失敗，請再試一次。');
+      }
       continue;
     }
 
