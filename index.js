@@ -94,7 +94,8 @@ const SKILLS = {
 };
 
 // 主選單文字
-function getMenu() {
+function getMenu(userId) {
+  const idLine = userId ? `\n\n🔑 你的ID：${userId}` : '';
   return `👋 你好！我是漢柏分身
 
 請選擇你需要的服務：
@@ -108,7 +109,7 @@ function getMenu() {
 3️⃣ 新人引導
 剛加入貴焿的夥伴從這裡開始
 
-輸入數字 1、2 或 3 開始`;
+輸入數字 1、2 或 3 開始${idLine}`;
 }
 
 // 驗證 LINE 簽名
@@ -211,7 +212,7 @@ app.post('/webhook', async (req, res) => {
     // 指令：重新開始
     if (userText === '選單' || userText === 'menu' || userText === '0') {
       sessions[userId] = { skill: null, history: [] };
-      await replyToLine(replyToken, getMenu());
+      await replyToLine(replyToken, getMenu(userId));
       continue;
     }
 
@@ -224,7 +225,7 @@ app.post('/webhook', async (req, res) => {
       } else if (userText === '3' || userText.includes('新人')) {
         session.skill = 'onboard';
       } else {
-        await replyToLine(replyToken, getMenu());
+        await replyToLine(replyToken, getMenu(userId));
         continue;
       }
 
