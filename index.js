@@ -96,7 +96,12 @@ async function parseReceiptImage(messageId) {
       role: 'user',
       content: [
         { type: 'image', source: { type: 'base64', media_type: contentType, data: base64 } },
-        { type: 'text', text: '這是發票或收據，提取金額與描述，只回傳 JSON：\n{"type":"expense|revenue","amount":數字,"category":"餐飲|交通|購物|孩子|醫療|娛樂|店務|其他","description":"簡短描述"}\n若無法辨識 → {"error":"無法辨識"}' }
+        { type: 'text', text: `這是台灣發票或收據照片，請仔細辨識：
+1. 找出「總計」「合計」「金額」「小計」或最大的數字作為金額
+2. 從店名或品項判斷分類
+3. 只回傳 JSON，不要其他文字：
+{"type":"expense","amount":數字,"category":"餐飲|交通|購物|孩子|醫療|娛樂|店務|其他","description":"店名或主要品項"}
+若真的完全無法辨識任何金額 → {"error":"無法辨識"}` }
       ]
     }]
   });
