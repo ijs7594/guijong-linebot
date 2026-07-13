@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const Anthropic = require('@anthropic-ai/sdk');
+const cron = require('node-cron');
 
 const app = express();
 
@@ -12,6 +13,11 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // 每個使用者的對話記憶（簡單版，重啟會清空）
 const sessions = {};
+
+// 推播名單（從環境變數載入，格式：PUSH_USER_IDS=U123,U456）
+const pushUserIds = new Set(
+  (process.env.PUSH_USER_IDS || '').split(',').filter(id => id.trim())
+);
 
 // 技能系統提示
 const SKILLS = {
@@ -130,6 +136,21 @@ async function replyToLine(replyToken, message) {
   return res;
 }
 
+// 主動推播訊息給指定使用者
+async function pushToUser(userId, message) {
+  await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+    },
+    body: JSON.stringify({
+      to: userId,
+      messages: [{ type: 'text', text: message }]
+    })
+  });
+}
+
 // 呼叫 Claude
 async function callClaude(systemPrompt, history, userMessage) {
   const messages = [
@@ -180,6 +201,12 @@ app.post('/webhook', async (req, res) => {
     }
 
     const session = sessions[userId];
+
+    // 指令：查詢自己的 LINE ID
+    if (userText === '我的ID' || userText === 'myid') {
+      await replyToLine(replyToken, `你的 LINE ID 是：\n${userId}`);
+      continue;
+    }
 
     // 指令：重新開始
     if (userText === '選單' || userText === 'menu' || userText === '0') {
@@ -238,5 +265,29 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// 定時推播（時區 UTC+8 台灣時間）
+// 早上 9:00 → UTC 01:00
+cron.schedule('0 1 * * *', async () => {
+  const msg = `☀️ 早安！今天也是美好的一天。
+
+準備好了嗎？傳 2 給我，開始今天的學習打卡。`;
+  for (const uid of pushUserIds) {
+    await pushToUser(uid, msg);
+  }
+}, { timezone: 'Asia/Taipei' });
+
+// 晚上 9:30 → 提醒打卡
+cron.schedule('30 21 * * *', async () => {
+  const msg = `🌙 今天結束前，記得打個卡。
+
+傳 2 給我，花 2 分鐘記錄今天的收穫。`;
+  for (const uid of pushUserIds) {
+    await pushToUser(uid, msg);
+  }
+}, { timezone: 'Asia/Taipei' });
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`推播名單：${[...pushUserIds].join(', ') || '（空）'}`);
+});
