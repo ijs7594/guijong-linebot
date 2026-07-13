@@ -81,6 +81,29 @@ async function parseFinanceEntry(text) {
   catch { return { error: '解析失敗' }; }
 }
 
+async function parseReceiptImage(messageId) {
+  const imgRes = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
+    headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` }
+  });
+  const buffer = await imgRes.arrayBuffer();
+  const base64 = Buffer.from(buffer).toString('base64');
+  const contentType = imgRes.headers.get('content-type') || 'image/jpeg';
+
+  const res = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 150,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: contentType, data: base64 } },
+        { type: 'text', text: '這是發票或收據，提取金額與描述，只回傳 JSON：\n{"type":"expense|revenue","amount":數字,"category":"餐飲|交通|購物|孩子|醫療|娛樂|店務|其他","description":"簡短描述"}\n若無法辨識 → {"error":"無法辨識"}' }
+      ]
+    }]
+  });
+  try { return JSON.parse(res.content[0].text.trim()); }
+  catch { return { error: '解析失敗' }; }
+}
+
 async function recordExpense(userId, amount, category, description) {
   if (!SUPABASE_URL) return false;
   try {
@@ -249,17 +272,26 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 
   for (const event of req.body.events || []) {
-    if (event.type !== 'message' || event.message.type !== 'text') continue;
+    if (event.type !== 'message') continue;
+    const isImage = event.message.type === 'image';
+    const isText = event.message.type === 'text';
+    if (!isText && !isImage) continue;
 
     const userId = event.source.userId;
-    const userText = event.message.text.trim().replace(/[！-～]/g, s =>
-      String.fromCharCode(s.charCodeAt(0) - 0xFEE0)
-    );
+    const userText = isText
+      ? event.message.text.trim().replace(/[！-～]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
+      : '[圖片]';
     console.log(`[${userId}] "${userText}"`);
     const replyToken = event.replyToken;
 
     if (!sessions[userId]) sessions[userId] = { skill: null, history: [], profile: null };
     const session = sessions[userId];
+
+    // 圖片在非記帳模式下提示
+    if (isImage && session.skill !== 'finance') {
+      await replyToLine(replyToken, '圖片記帳請先傳 4 進入記帳模式，再拍照傳送。');
+      continue;
+    }
 
     // 查詢 ID
     if (userText.toLowerCase().includes('我的id') || userText.toLowerCase() === 'myid') {
@@ -280,7 +312,9 @@ app.post('/webhook', async (req, res) => {
     // ── 記帳模式（不需要對話歷史）──
     if (session.skill === 'finance') {
       try {
-        const parsed = await parseFinanceEntry(userText);
+        const parsed = isImage
+          ? await parseReceiptImage(event.message.id)
+          : await parseFinanceEntry(userText);
         if (parsed.error) {
           await replyToLine(replyToken, `無法辨識，請試試：\n「午餐 260」\n「今日營業額 15000」\n\n或傳「選單」結束`);
         } else if (parsed.type === 'revenue') {
