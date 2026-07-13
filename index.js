@@ -188,8 +188,8 @@ app.post('/webhook', async (req, res) => {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
 
     const userId = event.source.userId;
-    // 全形轉半形數字，再 trim
-    const userText = event.message.text.trim().replace(/[１２３４５６７８９０]/g, s =>
+    // 全形轉半形（所有全形 ASCII 字元），再 trim
+    const userText = event.message.text.trim().replace(/[！-～]/g, s =>
       String.fromCharCode(s.charCodeAt(0) - 0xFEE0)
     );
     console.log(`[userId=${userId}] 收到訊息: "${userText}"`);
