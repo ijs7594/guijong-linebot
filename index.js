@@ -8,20 +8,107 @@ const app = express();
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-
-// 每個使用者的對話記憶（簡單版，重啟會清空）
 const sessions = {};
-
-// 推播名單（從環境變數載入，格式：PUSH_USER_IDS=U123,U456）
 const pushUserIds = new Set(
   (process.env.PUSH_USER_IDS || '').split(',').filter(id => id.trim())
 );
 
-// 技能系統提示
+// ── 記憶系統 ──────────────────────────────────────────
+
+async function dbFetch(path, options = {}) {
+  return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    }
+  });
+}
+
+async function loadProfile(userId) {
+  if (!SUPABASE_URL) return '';
+  try {
+    const res = await dbFetch(`user_memory?user_id=eq.${userId}&select=profile`);
+    const data = await res.json();
+    return data[0]?.profile || '';
+  } catch { return ''; }
+}
+
+async function saveProfile(userId, profile) {
+  if (!SUPABASE_URL) return;
+  try {
+    await dbFetch('user_memory', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates' },
+      body: JSON.stringify({ user_id: userId, profile, updated_at: new Date().toISOString() })
+    });
+  } catch {}
+}
+
+async function updateProfile(userId, history, existingProfile) {
+  const userMessages = history.filter(m => m.role === 'user').map(m => m.content).join('\n');
+  try {
+    const newProfile = await callClaude(
+      `你是記憶整理助手。根據對話用不超過80字整理使用者的小檔案。
+格式：姓名：\n角色：\n常聊主題：\n上次重點：\n狀態：
+現有記憶：\n${existingProfile || '（新使用者）'}`,
+      [], `這次對話：\n${userMessages}`
+    );
+    await saveProfile(userId, newProfile);
+    return newProfile;
+  } catch { return existingProfile; }
+}
+
+// ── 記帳系統 ──────────────────────────────────────────
+
+async function parseFinanceEntry(text) {
+  const res = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 120,
+    system: `解析記帳訊息，只回傳 JSON，不要其他文字：
+{"type":"expense|revenue","amount":數字,"category":"餐飲|交通|購物|孩子|醫療|娛樂|店務|其他","description":"簡短描述"}
+若含「營業額」「業績」「收入」→ type 為 revenue
+若無法辨識金額 → {"error":"無法辨識"}`,
+    messages: [{ role: 'user', content: text }]
+  });
+  try { return JSON.parse(res.content[0].text.trim()); }
+  catch { return { error: '解析失敗' }; }
+}
+
+async function recordExpense(userId, amount, category, description) {
+  if (!SUPABASE_URL) return false;
+  try {
+    const r = await dbFetch('expenses', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ user_id: userId, amount, category, description, date: new Date().toISOString().split('T')[0] })
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+async function recordRevenue(userId, amount, note) {
+  if (!SUPABASE_URL) return false;
+  try {
+    const r = await dbFetch('revenue', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ user_id: userId, amount, note, date: new Date().toISOString().split('T')[0] })
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+// ── 技能提示 ──────────────────────────────────────────
+
 const SKILLS = {
-  'career': {
+  career: {
     name: '職涯對話',
     prompt: `你是漢柏分身，一位教練型引導者，代表「貴焿古早味麵線羹」與員工對話。
 
@@ -44,7 +131,7 @@ const SKILLS = {
 對話結束前問：「今天這段對話，有什麼讓你比較清楚了嗎？」
 最後給一句不超過兩行的鼓勵。`
   },
-  'checkin': {
+  checkin: {
     name: '每日學習打卡',
     prompt: `你是漢柏分身的學習助手，代表「貴焿古早味麵線羹」陪員工打卡。
 
@@ -66,7 +153,7 @@ const SKILLS = {
 
 最後給一句溫暖的話，不超過一行。`
   },
-  'onboard': {
+  onboard: {
     name: '新人引導',
     prompt: `你是漢柏分身，代表「貴焿古早味麵線羹」歡迎新人加入。
 
@@ -93,9 +180,12 @@ const SKILLS = {
   }
 };
 
-// 主選單文字
-function getMenu(userId) {
-  const idLine = userId ? `\n\n🔑 你的ID：${userId}` : '';
+function buildSystemPrompt(skillPrompt, profile) {
+  if (!profile) return skillPrompt;
+  return `${skillPrompt}\n\n---\n【這位使用者的過去記憶】\n${profile}`;
+}
+
+function getMenu() {
   return `👋 你好！我是漢柏分身
 
 請選擇你需要的服務：
@@ -109,110 +199,101 @@ function getMenu(userId) {
 3️⃣ 新人引導
 剛加入貴焿的夥伴從這裡開始
 
-輸入數字 1、2 或 3 開始${idLine}`;
+4️⃣ 記帳 / 回報營業額
+傳一句話就能記錄
+
+輸入數字 1、2、3 或 4 開始`;
 }
 
-// 驗證 LINE 簽名
+// ── 工具函式 ──────────────────────────────────────────
+
 function verifySignature(body, signature) {
-  const hash = crypto
-    .createHmac('SHA256', LINE_CHANNEL_SECRET)
-    .update(body)
-    .digest('base64');
+  const hash = crypto.createHmac('SHA256', LINE_CHANNEL_SECRET).update(body).digest('base64');
   return hash === signature;
 }
 
-// 回傳訊息給 LINE
 async function replyToLine(replyToken, message) {
-  const res = await fetch('https://api.line.me/v2/bot/message/reply', {
+  await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
-    },
-    body: JSON.stringify({
-      replyToken,
-      messages: [{ type: 'text', text: message }]
-    })
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text: message }] })
   });
-  return res;
 }
 
-// 主動推播訊息給指定使用者
 async function pushToUser(userId, message) {
   await fetch('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
-    },
-    body: JSON.stringify({
-      to: userId,
-      messages: [{ type: 'text', text: message }]
-    })
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+    body: JSON.stringify({ to: userId, messages: [{ type: 'text', text: message }] })
   });
 }
 
-// 呼叫 Claude
 async function callClaude(systemPrompt, history, userMessage) {
-  const messages = [
-    ...history,
-    { role: 'user', content: userMessage }
-  ];
-
   const response = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 500,
     system: systemPrompt,
-    messages
+    messages: [...history, { role: 'user', content: userMessage }]
   });
-
   return response.content[0].text;
 }
 
-app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+// ── Webhook ──────────────────────────────────────────
 
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.get('/', (req, res) => res.send('貴焿 LINE Bot 運行中 🍜'));
 
 app.post('/webhook', async (req, res) => {
   const signature = req.headers['x-line-signature'];
-  if (!verifySignature(req.rawBody, signature)) {
-    return res.status(403).send('Invalid signature');
-  }
-
+  if (!verifySignature(req.rawBody, signature)) return res.status(403).send('Invalid signature');
   res.status(200).send('OK');
 
-  const events = req.body.events || [];
-
-  for (const event of events) {
+  for (const event of req.body.events || []) {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
 
     const userId = event.source.userId;
-    // 全形轉半形（所有全形 ASCII 字元），再 trim
     const userText = event.message.text.trim().replace(/[！-～]/g, s =>
       String.fromCharCode(s.charCodeAt(0) - 0xFEE0)
     );
-    console.log(`[userId=${userId}] 收到訊息: "${userText}"`);
+    console.log(`[${userId}] "${userText}"`);
     const replyToken = event.replyToken;
 
-    // 初始化 session
-    if (!sessions[userId]) {
-      sessions[userId] = { skill: null, history: [] };
-    }
-
+    if (!sessions[userId]) sessions[userId] = { skill: null, history: [], profile: null };
     const session = sessions[userId];
 
-    // 指令：查詢自己的 LINE ID
+    // 查詢 ID
     if (userText.toLowerCase().includes('我的id') || userText.toLowerCase() === 'myid') {
-      await replyToLine(replyToken, `你的 LINE ID 是：\n${userId}`);
+      await replyToLine(replyToken, `你的 LINE ID：\n${userId}`);
       continue;
     }
 
-    // 指令：重新開始
+    // 回選單
     if (userText === '選單' || userText === 'menu' || userText === '0') {
-      sessions[userId] = { skill: null, history: [] };
-      await replyToLine(replyToken, getMenu(userId));
+      if (session.skill && session.skill !== 'finance' && session.history.length > 2) {
+        updateProfile(userId, session.history, session.profile).catch(console.error);
+      }
+      sessions[userId] = { skill: null, history: [], profile: null };
+      await replyToLine(replyToken, getMenu());
+      continue;
+    }
+
+    // ── 記帳模式（不需要對話歷史）──
+    if (session.skill === 'finance') {
+      try {
+        const parsed = await parseFinanceEntry(userText);
+        if (parsed.error) {
+          await replyToLine(replyToken, `無法辨識，請試試：\n「午餐 260」\n「今日營業額 15000」\n\n或傳「選單」結束`);
+        } else if (parsed.type === 'revenue') {
+          await recordRevenue(userId, parsed.amount, parsed.description);
+          await replyToLine(replyToken, `💰 已記錄營業額 $${Number(parsed.amount).toLocaleString()}\n${parsed.description ? `（${parsed.description}）` : ''}\n\n繼續傳下一筆，或傳「選單」結束`);
+        } else {
+          await recordExpense(userId, parsed.amount, parsed.category, parsed.description);
+          await replyToLine(replyToken, `✅ ${parsed.description} $${parsed.amount}\n分類：${parsed.category}\n\n繼續傳下一筆，或傳「選單」結束`);
+        }
+      } catch (err) {
+        console.error(err);
+        await replyToLine(replyToken, '記帳失敗，請再試一次。');
+      }
       continue;
     }
 
@@ -224,15 +305,19 @@ app.post('/webhook', async (req, res) => {
         session.skill = 'checkin';
       } else if (userText === '3' || userText.includes('新人')) {
         session.skill = 'onboard';
+      } else if (userText === '4' || userText.includes('記帳') || userText.includes('營業額')) {
+        session.skill = 'finance';
+        await replyToLine(replyToken, `📒 記帳模式開啟\n\n直接傳就好，例如：\n「午餐 金園排骨 260」\n「今日營業額 18500」\n「停車費 80」\n\n傳「選單」結束記帳`);
+        continue;
       } else {
-        await replyToLine(replyToken, getMenu(userId));
+        await replyToLine(replyToken, getMenu());
         continue;
       }
 
-      // 技能開場
+      session.profile = await loadProfile(userId);
       const skill = SKILLS[session.skill];
       try {
-        const opening = await callClaude(skill.prompt, [], '請開始');
+        const opening = await callClaude(buildSystemPrompt(skill.prompt, session.profile), [], '請開始');
         session.history = [
           { role: 'user', content: '請開始' },
           { role: 'assistant', content: opening }
@@ -249,15 +334,15 @@ app.post('/webhook', async (req, res) => {
     // 繼續對話
     const skill = SKILLS[session.skill];
     try {
-      const reply = await callClaude(skill.prompt, session.history, userText);
+      const reply = await callClaude(buildSystemPrompt(skill.prompt, session.profile), session.history, userText);
       session.history.push({ role: 'user', content: userText });
       session.history.push({ role: 'assistant', content: reply });
-
-      // 只保留最近 10 輪對話避免太長
-      if (session.history.length > 20) {
-        session.history = session.history.slice(-20);
+      if (session.history.length > 20) session.history = session.history.slice(-20);
+      if (session.history.length % 8 === 0) {
+        updateProfile(userId, session.history, session.profile)
+          .then(p => { session.profile = p; })
+          .catch(console.error);
       }
-
       await replyToLine(replyToken, reply);
     } catch (err) {
       console.error(err);
@@ -266,29 +351,20 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// 定時推播（時區 UTC+8 台灣時間）
-// 早上 9:00 → UTC 01:00
-cron.schedule('0 1 * * *', async () => {
-  const msg = `☀️ 早安！今天也是美好的一天。
+// ── 定時推播 ──────────────────────────────────────────
 
-準備好了嗎？傳 2 給我，開始今天的學習打卡。`;
-  for (const uid of pushUserIds) {
-    await pushToUser(uid, msg);
-  }
+cron.schedule('0 9 * * *', async () => {
+  const msg = `☀️ 早安！今天也是美好的一天。\n\n準備好了嗎？傳 2 給我，開始今天的學習打卡。`;
+  for (const uid of pushUserIds) await pushToUser(uid, msg);
 }, { timezone: 'Asia/Taipei' });
 
-// 晚上 9:30 → 提醒打卡
 cron.schedule('30 21 * * *', async () => {
-  const msg = `🌙 今天結束前，記得打個卡。
-
-傳 2 給我，花 2 分鐘記錄今天的收穫。`;
-  for (const uid of pushUserIds) {
-    await pushToUser(uid, msg);
-  }
+  const msg = `🌙 今天結束前，記得打個卡。\n\n傳 2 給我，花 2 分鐘記錄今天的收穫。`;
+  for (const uid of pushUserIds) await pushToUser(uid, msg);
 }, { timezone: 'Asia/Taipei' });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`推播名單：${[...pushUserIds].join(', ') || '（空）'}`);
+  console.log(`Supabase：${SUPABASE_URL ? '已連接' : '未設定'}`);
 });
