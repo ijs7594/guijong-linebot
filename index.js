@@ -203,7 +203,7 @@ app.post('/webhook', async (req, res) => {
     const session = sessions[userId];
 
     // 指令：查詢自己的 LINE ID
-    if (userText === '我的ID' || userText === 'myid') {
+    if (userText.toLowerCase().includes('我的id') || userText.toLowerCase() === 'myid') {
       await replyToLine(replyToken, `你的 LINE ID 是：\n${userId}`);
       continue;
     }
