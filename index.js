@@ -207,10 +207,10 @@ async function parseStoreLog(text, existingStores) {
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 150,
     system: `解析展店心得訊息，只回傳 JSON，不要其他文字：
-{"store_name":"店名","category":"選址|裝潢|人事|物流|行銷|口味|客訴|其他","content":"心得內容","exp":5或10或20}
+{"store_name":"店名","category":"選址|裝潢|人事|物流|行銷|口味|客訴|其他","content":"心得內容","exp":15或30或60}
 現有店家：${namesStr}
 若訊息裡的店名與現有店家接近，請用現有店家的完整名稱；否則視為新店家，用訊息裡的名稱。
-exp 判斷：小發現/小提醒=5，一般心得/收穫=10，重大突破/重要教訓=20，無法判斷則用10。
+exp 判斷：小發現/小提醒=15，一般心得/收穫=30，重大突破/重要教訓=60，無法判斷則用30。
 若完全無法辨識店名 → {"error":"無法辨識店名"}`,
     messages: [{ role: 'user', content: text }]
   });
