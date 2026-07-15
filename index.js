@@ -8,6 +8,7 @@ const app = express();
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const XAI_API_KEY = process.env.XAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
@@ -89,24 +90,36 @@ async function parseReceiptImage(messageId) {
   const base64 = Buffer.from(buffer).toString('base64');
   const contentType = imgRes.headers.get('content-type') || 'image/jpeg';
 
-  const res = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 150,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: contentType, data: base64 } },
-        { type: 'text', text: `這是台灣發票或收據照片，請仔細辨識：
+  const prompt = `這是台灣發票或收據照片，請仔細辨識：
 1. 找出「總計」「合計」「金額」「小計」或最大的數字作為金額
 2. 從店名或品項判斷分類
 3. 只回傳 JSON，不要其他文字：
 {"type":"expense","amount":數字,"category":"餐飲|交通|購物|孩子|醫療|娛樂|店務|其他","description":"店名或主要品項"}
-若真的完全無法辨識任何金額 → {"error":"無法辨識"}` }
-      ]
-    }]
+若真的完全無法辨識任何金額 → {"error":"無法辨識"}`;
+
+  const res = await fetch('https://api.x.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${XAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: 'grok-4.5',
+      max_tokens: 150,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:${contentType};base64,${base64}` } },
+          { type: 'text', text: prompt }
+        ]
+      }]
+    })
   });
-  try { return JSON.parse(res.content[0].text.trim()); }
-  catch { return { error: '解析失敗' }; }
+  const data = await res.json();
+  try {
+    const raw = data.choices[0].message.content.trim().replace(/^```(?:json)?|```$/g, '').trim();
+    return JSON.parse(raw);
+  } catch { return { error: '解析失敗' }; }
 }
 
 async function recordExpense(userId, amount, category, description) {
@@ -131,6 +144,86 @@ async function recordRevenue(userId, amount, note) {
     });
     return r.ok;
   } catch { return false; }
+}
+
+// ── 展店紀錄系統 ──────────────────────────────────────────
+
+async function getStoreNames() {
+  if (!SUPABASE_URL) return [];
+  try {
+    const res = await dbFetch('stores?select=id,name');
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+async function parseStoreLog(text, existingStores) {
+  const namesStr = existingStores.map(s => s.name).join('、') || '（尚無店家）';
+  const res = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 150,
+    system: `解析展店心得訊息，只回傳 JSON，不要其他文字：
+{"store_name":"店名","category":"選址|裝潢|人事|物流|行銷|口味|客訴|其他","content":"心得內容","exp":5或10或20}
+現有店家：${namesStr}
+若訊息裡的店名與現有店家接近，請用現有店家的完整名稱；否則視為新店家，用訊息裡的名稱。
+exp 判斷：小發現/小提醒=5，一般心得/收穫=10，重大突破/重要教訓=20，無法判斷則用10。
+若完全無法辨識店名 → {"error":"無法辨識店名"}`,
+    messages: [{ role: 'user', content: text }]
+  });
+  try { return JSON.parse(res.content[0].text.trim()); }
+  catch { return { error: '解析失敗' }; }
+}
+
+async function recordStoreLog(storeName, category, content, exp, imageUrl) {
+  if (!SUPABASE_URL) return false;
+  try {
+    const found = await dbFetch(`stores?name=eq.${encodeURIComponent(storeName)}&select=id`);
+    const list = await found.json();
+    let storeId = Array.isArray(list) && list.length > 0 ? list[0].id : null;
+
+    if (!storeId) {
+      const created = await dbFetch('stores', {
+        method: 'POST',
+        headers: { Prefer: 'return=representation' },
+        body: JSON.stringify({ name: storeName, status: '籌備中' })
+      });
+      const createdData = await created.json();
+      storeId = createdData[0]?.id;
+    }
+    if (!storeId) return false;
+
+    const body = { store_id: storeId, category, content, exp };
+    if (imageUrl) body.image_url = imageUrl;
+
+    const r = await dbFetch('store_logs', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify(body)
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+async function uploadStorePhoto(messageId) {
+  const imgRes = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
+    headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` }
+  });
+  const buffer = await imgRes.arrayBuffer();
+  const contentType = imgRes.headers.get('content-type') || 'image/jpeg';
+  const ext = contentType.includes('png') ? 'png' : 'jpg';
+  const filename = `${Date.now()}-${messageId}.${ext}`;
+
+  const uploadRes = await fetch(`${SUPABASE_URL}/storage/v1/object/store-photos/${filename}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': contentType
+    },
+    body: Buffer.from(buffer)
+  });
+  if (!uploadRes.ok) return null;
+  return `${SUPABASE_URL}/storage/v1/object/public/store-photos/${filename}`;
 }
 
 // ── 技能提示 ──────────────────────────────────────────
@@ -230,7 +323,10 @@ function getMenu() {
 4️⃣ 記帳 / 回報營業額
 傳一句話就能記錄
 
-輸入數字 1、2、3 或 4 開始`;
+5️⃣ 展店紀錄
+記一筆心得，累積這間店的經驗值
+
+輸入數字 1、2、3、4 或 5 開始`;
 }
 
 // ── 工具函式 ──────────────────────────────────────────
@@ -289,12 +385,12 @@ app.post('/webhook', async (req, res) => {
     console.log(`[${userId}] "${userText}"`);
     const replyToken = event.replyToken;
 
-    if (!sessions[userId]) sessions[userId] = { skill: null, history: [], profile: null };
+    if (!sessions[userId]) sessions[userId] = { skill: null, history: [], profile: null, pendingImageUrl: null };
     const session = sessions[userId];
 
-    // 圖片在非記帳模式下提示
-    if (isImage && session.skill !== 'finance') {
-      await replyToLine(replyToken, '圖片記帳請先傳 4 進入記帳模式，再拍照傳送。');
+    // 圖片在非記帳／展店模式下提示
+    if (isImage && session.skill !== 'finance' && session.skill !== 'storelog') {
+      await replyToLine(replyToken, '圖片記帳請先傳 4 進入記帳模式，或傳 5 進入展店紀錄模式，再拍照傳送。');
       continue;
     }
 
@@ -309,7 +405,7 @@ app.post('/webhook', async (req, res) => {
       if (session.skill && session.skill !== 'finance' && session.history.length > 2) {
         updateProfile(userId, session.history, session.profile).catch(console.error);
       }
-      sessions[userId] = { skill: null, history: [], profile: null };
+      sessions[userId] = { skill: null, history: [], profile: null, pendingImageUrl: null };
       await replyToLine(replyToken, getMenu());
       continue;
     }
@@ -336,6 +432,43 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    // ── 展店紀錄模式（不需要對話歷史）──
+    if (session.skill === 'storelog') {
+      if (isImage) {
+        try {
+          const url = await uploadStorePhoto(event.message.id);
+          if (!url) throw new Error('upload failed');
+          session.pendingImageUrl = url;
+          await replyToLine(replyToken, '📷 照片收到了，再傳一句話說明是哪間店、什麼心得（例如：三民店 裝潢 天花板完工了），我會把照片一起存進去。');
+        } catch (err) {
+          console.error(err);
+          await replyToLine(replyToken, '照片上傳失敗，請再試一次。');
+        }
+        continue;
+      }
+      try {
+        const existing = await getStoreNames();
+        const parsed = await parseStoreLog(userText, existing);
+        if (parsed.error) {
+          await replyToLine(replyToken, `無法辨識，請試試：\n「店名 分類 心得內容」\n例如「三民店 選址 巷口那間租金太高」\n\n或傳「選單」結束`);
+        } else {
+          const exp = parsed.exp || 10;
+          const imageUrl = session.pendingImageUrl;
+          const ok = await recordStoreLog(parsed.store_name, parsed.category, parsed.content, exp, imageUrl);
+          if (ok) {
+            session.pendingImageUrl = null;
+            await replyToLine(replyToken, `✅ 已記錄到「${parsed.store_name}」${imageUrl ? '（含照片）' : ''}\n分類：${parsed.category}\n+${exp} EXP\n\n繼續傳下一筆，或傳「選單」結束`);
+          } else {
+            await replyToLine(replyToken, '記錄失敗，請再試一次。');
+          }
+        }
+      } catch (err) {
+        console.error(err);
+        await replyToLine(replyToken, '記錄失敗，請再試一次。');
+      }
+      continue;
+    }
+
     // 選擇技能
     if (!session.skill) {
       if (userText === '1' || userText.includes('職涯')) {
@@ -347,6 +480,10 @@ app.post('/webhook', async (req, res) => {
       } else if (userText === '4' || userText.includes('記帳') || userText.includes('營業額')) {
         session.skill = 'finance';
         await replyToLine(replyToken, `📒 記帳模式開啟\n\n直接傳就好，例如：\n「午餐 金園排骨 260」\n「今日營業額 18500」\n「停車費 80」\n\n傳「選單」結束記帳`);
+        continue;
+      } else if (userText === '5' || userText.includes('展店')) {
+        session.skill = 'storelog';
+        await replyToLine(replyToken, `🏪 展店紀錄模式開啟\n\n直接傳心得就好，例如：\n「三民店 選址 巷口那間租金太高，以後要抓預算上限」\n「新開的左營店 人事 找到超讚的店長」\n\n傳「選單」結束`);
         continue;
       } else {
         await replyToLine(replyToken, getMenu());
@@ -392,10 +529,6 @@ app.post('/webhook', async (req, res) => {
 
 // ── 定時推播 ──────────────────────────────────────────
 
-cron.schedule('0 9 * * *', async () => {
-  const msg = `☀️ 早安！今天也是美好的一天。\n\n準備好了嗎？傳 2 給我，開始今天的學習打卡。`;
-  for (const uid of pushUserIds) await pushToUser(uid, msg);
-}, { timezone: 'Asia/Taipei' });
 
 cron.schedule('30 21 * * *', async () => {
   const msg = `🌙 今天結束前，記得打個卡。\n\n傳 2 給我，花 2 分鐘記錄今天的收穫。`;
