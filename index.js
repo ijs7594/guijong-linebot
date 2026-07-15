@@ -12,6 +12,7 @@ const XAI_API_KEY = process.env.XAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const NOTIFY_SECRET = process.env.NOTIFY_SECRET;
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const sessions = {};
@@ -415,6 +416,27 @@ async function callClaude(systemPrompt, history, userMessage) {
 
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.get('/', (req, res) => res.send('貴焿 LINE Bot 運行中 🍜'));
+
+app.use('/api', (req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+app.post('/api/notify', async (req, res) => {
+  if (!NOTIFY_SECRET || req.body.secret !== NOTIFY_SECRET) return res.status(403).send('forbidden');
+  const message = (req.body.message || '').trim();
+  if (!message) return res.status(400).send('缺少 message');
+  try {
+    for (const uid of pushUserIds) await pushToUser(uid, message);
+    res.send('ok');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('通知失敗');
+  }
+});
 
 app.post('/webhook', async (req, res) => {
   const signature = req.headers['x-line-signature'];
