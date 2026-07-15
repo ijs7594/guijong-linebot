@@ -11,6 +11,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const XAI_API_KEY = process.env.XAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const sessions = {};
@@ -144,6 +145,48 @@ async function recordRevenue(userId, amount, note) {
     });
     return r.ok;
   } catch { return false; }
+}
+
+// ── 語音轉文字 (Groq Whisper) ──────────────────────────────────────────
+
+async function transcribeAudio(audioBuffer) {
+  const formData = new FormData();
+  const blob = new Blob([audioBuffer], { type: 'audio/m4a' });
+  formData.append('file', blob, 'audio.m4a');
+  formData.append('model', 'whisper-large-v3');
+  formData.append('language', 'zh');
+  formData.append('response_format', 'text');
+
+  const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+    body: formData
+  });
+  if (!res.ok) throw new Error(`Groq error: ${await res.text()}`);
+  return (await res.text()).trim();
+}
+
+// ── 任務系統 ──────────────────────────────────────────
+
+async function saveTask(content, source = 'line_voice') {
+  if (!SUPABASE_URL) return false;
+  try {
+    const r = await dbFetch('tasks', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ content, source, status: 'pending' })
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+async function listPendingTasks() {
+  if (!SUPABASE_URL) return [];
+  try {
+    const res = await dbFetch('tasks?status=eq.pending&order=created_at.desc&limit=10');
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
 }
 
 // ── 展店紀錄系統 ──────────────────────────────────────────
@@ -326,7 +369,13 @@ function getMenu() {
 5️⃣ 展店紀錄
 記一筆心得，累積這間店的經驗值
 
-輸入數字 1、2、3、4 或 5 開始`;
+6️⃣ 待辦任務清單
+查看目前未完成的任務
+
+🎙️ 說語音 → 直接記錄任務
+✍️ 傳「任務 xxx」→ 文字新增任務
+
+輸入數字開始，或直接說語音`;
 }
 
 // ── 工具函式 ──────────────────────────────────────────
@@ -375,8 +424,26 @@ app.post('/webhook', async (req, res) => {
   for (const event of req.body.events || []) {
     if (event.type !== 'message') continue;
     const isImage = event.message.type === 'image';
-    const isText = event.message.type === 'text';
-    if (!isText && !isImage) continue;
+    const isText  = event.message.type === 'text';
+    const isAudio = event.message.type === 'audio';
+    if (!isText && !isImage && !isAudio) continue;
+
+    // ── 語音訊息 → 直接存任務 ──
+    if (isAudio) {
+      try {
+        const audioRes = await fetch(`https://api-data.line.me/v2/bot/message/${event.message.id}/content`, {
+          headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` }
+        });
+        const audioBuffer = await audioRes.arrayBuffer();
+        const text = await transcribeAudio(audioBuffer);
+        await saveTask(text, 'line_voice');
+        await replyToLine(replyToken, `✅ 任務記錄\n\n「${text}」\n\n網頁已同步 → ijs7594.github.io/inbox.html\n\n傳「選單」繼續`);
+      } catch (err) {
+        console.error('語音辨識失敗:', err);
+        await replyToLine(replyToken, '語音辨識失敗，請改用文字：\n「任務 你的任務內容」');
+      }
+      continue;
+    }
 
     const userId = event.source.userId;
     const userText = isText
@@ -391,6 +458,30 @@ app.post('/webhook', async (req, res) => {
     // 圖片在非記帳／展店模式下提示
     if (isImage && session.skill !== 'finance' && session.skill !== 'storelog') {
       await replyToLine(replyToken, '圖片記帳請先傳 4 進入記帳模式，或傳 5 進入展店紀錄模式，再拍照傳送。');
+      continue;
+    }
+
+    // ── 文字新增任務 ──
+    if (userText.startsWith('任務 ') || userText.startsWith('todo ')) {
+      const content = userText.replace(/^(任務|todo)\s+/i, '').trim();
+      if (content) {
+        await saveTask(content, 'line_text');
+        await replyToLine(replyToken, `✅ 任務記錄\n\n「${content}」\n\n繼續傳下一個，或傳「選單」`);
+      } else {
+        await replyToLine(replyToken, '請在「任務」後面加上內容，例如：\n「任務 追蹤小明的排班問題」');
+      }
+      continue;
+    }
+
+    // ── 查看待辦 ──
+    if (userText === '6' || userText === '待辦' || userText === '任務清單') {
+      const tasks = await listPendingTasks();
+      if (!tasks.length) {
+        await replyToLine(replyToken, '目前沒有待辦任務 🎉\n\n說語音或傳「任務 xxx」新增');
+      } else {
+        const list = tasks.map((t, i) => `${i + 1}. ${t.content}`).join('\n');
+        await replyToLine(replyToken, `📋 待辦（${tasks.length} 件）\n\n${list}\n\n到網頁標記完成 →\nijs7594.github.io/inbox.html`);
+      }
       continue;
     }
 
