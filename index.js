@@ -425,6 +425,30 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
+app.post('/api/classify-log', async (req, res) => {
+  if (!NOTIFY_SECRET || req.body.secret !== NOTIFY_SECRET) return res.status(403).send('forbidden');
+  const content = (req.body.content || '').trim();
+  const category = req.body.category || '其他';
+  if (!content) return res.status(400).send('缺少 content');
+  try {
+    const result = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      system: `你是漢柏分身，幫展店心得評分並給一句回應。只回傳 JSON，不要其他文字：
+{"exp":15或30或60,"reply":"一句不超過30字的回應，溫暖有教練感，像是看見他寫的東西"}
+exp 判斷：小發現/小提醒=15，一般心得/收穫=30，重大突破/重要教訓=60，無法判斷則用30。
+這筆心得的分類：${category}`,
+      messages: [{ role: 'user', content }]
+    });
+    const raw = result.content[0].text.trim().replace(/^```(?:json)?|```$/g, '').trim();
+    const parsed = JSON.parse(raw);
+    res.json({ exp: parsed.exp || 30, reply: parsed.reply || '' });
+  } catch (err) {
+    console.error(err);
+    res.json({ exp: 30, reply: '' });
+  }
+});
+
 app.post('/api/notify', async (req, res) => {
   if (!NOTIFY_SECRET || req.body.secret !== NOTIFY_SECRET) return res.status(403).send('forbidden');
   const message = (req.body.message || '').trim();
