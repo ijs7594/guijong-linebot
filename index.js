@@ -21,6 +21,12 @@ const pushUserIds = new Set(
   (process.env.PUSH_USER_IDS || '').split(',').filter(id => id.trim())
 );
 
+// 執行長本人專屬功能（每日工事／SOP／全店記帳）都透過這個函式判斷，
+// 身份規則只在這裡改，避免散在各處漏改造成漏洞。
+function isHanbo(userId) {
+  return Boolean(HANBO_USER_ID) && userId === HANBO_USER_ID;
+}
+
 // ── 記憶系統 ──────────────────────────────────────────
 
 async function dbFetch(path, options = {}) {
@@ -178,7 +184,7 @@ async function getOperatingStores() {
 }
 
 async function getAllowedStores(userId) {
-  if (HANBO_USER_ID && userId === HANBO_USER_ID) return getOperatingStores();
+  if (isHanbo(userId)) return getOperatingStores();
   if (!SUPABASE_URL) return [];
   try {
     const res = await dbFetch(`store_staff?line_user_id=eq.${userId}&select=stores(id,name)`);
@@ -481,7 +487,7 @@ function buildWorklogSummary(logs, title) {
 }
 
 function getMenu(userId) {
-  const isHanbo = HANBO_USER_ID && userId === HANBO_USER_ID;
+  const hanbo = isHanbo(userId);
   return `👋 你好！我是漢柏分身
 
 請選擇你需要的服務：
@@ -494,12 +500,12 @@ function getMenu(userId) {
 
 3️⃣ 待辦任務清單
 查看目前未完成的任務
-${isHanbo ? `
+${hanbo ? `
 4️⃣ 每日工事
 做完一件事就丟給我，我幫你判斷該教會員工、不該做、還是只能你自己來
 ` : ''}
 🎙️ 說語音 → 直接記錄任務
-✍️ 傳「任務 xxx」→ 文字新增任務${isHanbo ? '\n📋 傳「SOP」→ 整理累積到3次的教得會事項' : ''}
+✍️ 傳「任務 xxx」→ 文字新增任務${hanbo ? '\n📋 傳「SOP」→ 整理累積到3次的教得會事項' : ''}
 
 輸入數字開始，或直接說語音`;
 }
@@ -654,7 +660,7 @@ app.post('/webhook', async (req, res) => {
 
     // ── 觸發七何寫SOP（只開放給執行長，資料來源是他自己的每日工事紀錄）──
     if ((userText === 'SOP' || userText.toLowerCase() === 'sop' || userText === '七何') && !session.awaitingSopChoice && session.skill !== 'sopwrite') {
-      if (!HANBO_USER_ID || userId !== HANBO_USER_ID) {
+      if (!isHanbo(userId)) {
         await replyToLine(replyToken, getMenu(userId));
         continue;
       }
@@ -892,7 +898,7 @@ app.post('/webhook', async (req, res) => {
         await replyToLine(replyToken, `🏪 展店紀錄模式開啟\n\n直接傳心得就好，例如：\n「三民店 選址 巷口那間租金太高，以後要抓預算上限」\n「新開的左營店 人事 找到超讚的店長」\n\n傳「選單」結束`);
         continue;
       } else if (userText === '4' || userText.includes('工事')) {
-        if (!HANBO_USER_ID || userId !== HANBO_USER_ID) {
+        if (!isHanbo(userId)) {
           await replyToLine(replyToken, getMenu(userId));
           continue;
         }
@@ -943,19 +949,21 @@ cron.schedule('0 8 * * *', async () => {
   }
 }, { timezone: 'Asia/Taipei' });
 
-// 每月 27 號提醒填自我盤點表，時間點卡在月底前，讓店長反思的是「這個月」，
+// 每月 27 號提醒填月底自我盤點，時間點卡在月底前，讓店長反思的是「這個月」，
 // 剛好接上 8/1 那份評論月報回顧的也是同一個月份。
 // 目前還沒有店長版的 LINE ID 名冊，所以先推給漢柏，由他轉發到店長群組；
 // 之後有 supervisor_users 擴充成完整名冊，可以改成直接推給每位店長。
-const SELF_CHECKIN_FORM_URL = 'https://docs.google.com/forms/d/180kvI7K1QHeciS4WJQ-A1dfV52N165xXJ0h4F6RtD70/viewform';
+// 填寫頁面在夥伴入口裡（checkin.html），不是 Google 表單——用網頁是因為
+// 店家可以直接綁定不用打字選，題目也能做成點選量表，比表單快也不會比對錯店。
+const SELF_CHECKIN_URL = 'https://ijs7594.github.io/checkin.html';
 cron.schedule('0 10 27 * *', async () => {
   if (!HANBO_USER_ID) return;
   try {
     await pushToUser(HANBO_USER_ID,
-      `📝 該提醒店長們填「自我盤點表」了\n\n這個月快結束了，麻煩轉發給店長群組，請大家花幾分鐘回顧這個月：\n${SELF_CHECKIN_FORM_URL}`
+      `📝 該提醒店長們填「月底自我盤點」了\n\n這個月快結束了，麻煩轉發給店長群組，請大家花幾分鐘回顧這個月（也可以從夥伴入口點進去）：\n${SELF_CHECKIN_URL}`
     );
   } catch (err) {
-    console.error('自我盤點表提醒推播失敗:', err);
+    console.error('自我盤點提醒推播失敗:', err);
   }
 }, { timezone: 'Asia/Taipei' });
 
