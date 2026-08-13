@@ -13,6 +13,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET;
+const HANBO_USER_ID = process.env.HANBO_USER_ID;
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const sessions = {};
@@ -32,40 +33,6 @@ async function dbFetch(path, options = {}) {
       ...(options.headers || {})
     }
   });
-}
-
-async function loadProfile(userId) {
-  if (!SUPABASE_URL) return '';
-  try {
-    const res = await dbFetch(`user_memory?user_id=eq.${userId}&select=profile`);
-    const data = await res.json();
-    return data[0]?.profile || '';
-  } catch { return ''; }
-}
-
-async function saveProfile(userId, profile) {
-  if (!SUPABASE_URL) return;
-  try {
-    await dbFetch('user_memory', {
-      method: 'POST',
-      headers: { Prefer: 'resolution=merge-duplicates' },
-      body: JSON.stringify({ user_id: userId, profile, updated_at: new Date().toISOString() })
-    });
-  } catch {}
-}
-
-async function updateProfile(userId, history, existingProfile) {
-  const userMessages = history.filter(m => m.role === 'user').map(m => m.content).join('\n');
-  try {
-    const newProfile = await callClaude(
-      `你是記憶整理助手。根據對話用不超過80字整理使用者的小檔案。
-格式：姓名：\n角色：\n常聊主題：\n上次重點：\n狀態：
-現有記憶：\n${existingProfile || '（新使用者）'}`,
-      [], `這次對話：\n${userMessages}`
-    );
-    await saveProfile(userId, newProfile);
-    return newProfile;
-  } catch { return existingProfile; }
 }
 
 // ── 記帳系統 ──────────────────────────────────────────
@@ -124,25 +91,34 @@ async function parseReceiptImage(messageId) {
   } catch { return { error: '解析失敗' }; }
 }
 
-async function recordExpense(userId, amount, category, description) {
+async function recordDailyExpense(storeId, amount, category, description) {
   if (!SUPABASE_URL) return false;
   try {
-    const r = await dbFetch('expenses', {
+    const r = await dbFetch('store_daily_expenses', {
       method: 'POST',
       headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ user_id: userId, amount, category, description, date: new Date().toISOString().split('T')[0] })
+      body: JSON.stringify({
+        store_id: storeId,
+        amount,
+        description: `【費用】${category}：${description}`,
+        date: new Date().toISOString().split('T')[0]
+      })
     });
     return r.ok;
   } catch { return false; }
 }
 
-async function recordRevenue(userId, amount, note) {
+async function recordDailyRevenue(storeId, amount) {
   if (!SUPABASE_URL) return false;
   try {
-    const r = await dbFetch('revenue', {
+    const r = await dbFetch('store_daily_report?on_conflict=store_id,date', {
       method: 'POST',
-      headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ user_id: userId, amount, note, date: new Date().toISOString().split('T')[0] })
+      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify({
+        store_id: storeId,
+        morning_revenue: amount,
+        date: new Date().toISOString().split('T')[0]
+      })
     });
     return r.ok;
   } catch { return false; }
@@ -188,6 +164,51 @@ async function listPendingTasks() {
     const data = await res.json();
     return Array.isArray(data) ? data : [];
   } catch { return []; }
+}
+
+// ── 每日摘要 ──────────────────────────────────────────
+
+async function getOperatingStores() {
+  if (!SUPABASE_URL) return [];
+  try {
+    const res = await dbFetch('stores?status=eq.營運中&select=id,name');
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+async function getAllowedStores(userId) {
+  if (HANBO_USER_ID && userId === HANBO_USER_ID) return getOperatingStores();
+  if (!SUPABASE_URL) return [];
+  try {
+    const res = await dbFetch(`store_staff?line_user_id=eq.${userId}&select=stores(id,name)`);
+    const data = await res.json();
+    return Array.isArray(data) ? data.map(r => r.stores).filter(Boolean) : [];
+  } catch { return []; }
+}
+
+async function buildDailySummary() {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+  const stores = await getOperatingStores();
+  let notReported = [];
+  try {
+    const res = await dbFetch(`store_daily_report?date=eq.${yesterday}&select=store_id`);
+    const reported = await res.json();
+    const reportedIds = new Set((Array.isArray(reported) ? reported : []).map(r => r.store_id));
+    notReported = stores.filter(s => !reportedIds.has(s.id)).map(s => s.name);
+  } catch {}
+  const tasks = await listPendingTasks();
+
+  let msg = `☀️ 早安，今天的營運摘要\n\n📅 昨天（${yesterday}）日報回報：`;
+  if (!stores.length) {
+    msg += '目前沒有營運中門店資料';
+  } else if (!notReported.length) {
+    msg += `全數 ${stores.length} 間門店都已回報 ✅`;
+  } else {
+    msg += `${stores.length - notReported.length}/${stores.length} 間已回報\n未回報：${notReported.join('、')}`;
+  }
+  msg += `\n\n📋 待辦 Inbox：${tasks.length} 件待處理`;
+  return msg;
 }
 
 // ── 展店紀錄系統 ──────────────────────────────────────────
@@ -270,111 +291,215 @@ async function uploadStorePhoto(messageId) {
   return `${SUPABASE_URL}/storage/v1/object/public/store-photos/${filename}`;
 }
 
-// ── 技能提示 ──────────────────────────────────────────
+// ── 每日工事紀錄系統 ──────────────────────────────────────────
 
-const SKILLS = {
-  career: {
-    name: '職涯對話',
-    prompt: `你是漢柏分身，一位教練型引導者，代表「貴焿古早味麵線羹」與員工對話。
+async function parseWorkLog(text) {
+  const res = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 400,
+    system: `你是漢柏分身，正在幫執行長本人分析他剛完成的一件工作。他的教練教過他，看一件事要「由內而外」：先看人，再看事，時地物是最後才看的背景資訊，不要一開始就陷入瑣事細節。只回傳 JSON，不要其他文字：
+{"who":"這件事核心牽涉到的人，例如某員工、某廠商、某夥伴；沒有明確對象就填 null","label":"教得會|不該做|親力親為","value":1到5的整數,"place":"地點或店名，沒有就填 null","thing":"牽涉到的物件或資源，例如合約、設備、發票；沒有就填 null","reply":"一句不超過35字的回應，講清楚為什麼歸這一類，語氣像教練，直接但溫暖"}
 
-現在進入「職涯對話」模式。
+分析順序（由內而外，決定你怎麼想，不是輸出順序）：
+1. 人：這件事的核心跟誰有關？是員工、廠商、還是只有漢柏自己？
+2. 事：實際做了什麼判斷或動作？（這決定 label 跟 value）
+3. 地／物：發生在哪個店、涉及什麼物件或資源？能辨識就填，不確定寧可留 null，不要亂猜
 
-規則：
-- 不直接給答案，用問題帶對方挖掘自己的答案
-- 每次只問一個問題，等對方回答再繼續
-- 語氣溫暖、簡潔、有深度
-- 先確認對方現在的狀態，再慢慢深入
+分類原則：
+- 教得會：有明確流程或判斷邏輯，員工學過就能做，執行長不必每次都親自處理。這類事情現在多半是靠執行長「想到就做」、沒有寫下來，歸這類代表它該被整理成工作說明書／SOP，之後才能真的交出去，不是只在腦子裡會而已
+- 不該做：對公司或店務價值低、屬於瑣事，應該授權出去或乾脆停止，不值得執行長投入時間
+- 親力親為：需要執行長的角色、信任關係、或關鍵決策權，現階段別人做不了
 
-開場請說：「你今天想聊的，是關於工作的什麼部分？」
-
-根據對方回答選擇方向：
-- 不知道未來方向 → 挖掘熱情與強項
-- 覺得卡住了 → 問他卡在哪裡
-- 想轉換角色 → 先了解現在再問想去哪
-- 想被肯定 → 先看見他再問他怎麼看自己
-
-對話結束前問：「今天這段對話，有什麼讓你比較清楚了嗎？」
-最後給一句不超過兩行的鼓勵。`
-  },
-  checkin: {
-    name: '每日學習打卡',
-    prompt: `你是漢柏分身的學習助手，代表「貴焿古早味麵線羹」陪員工打卡。
-
-現在進入「每日學習打卡」模式。
-
-依序問以下四題，每次問一題，等對方回答再繼續：
-1. 「今天你做了什麼？（不用完整，說重點就好）」
-2. 「今天有沒有遇到什麼卡關或不確定的地方？」
-3. 「今天你覺得自己做得不錯的一件事是什麼？」
-4. 「明天你最想完成的一件事是？」
-
-四題都答完後，整理輸出：
-
-📅 打卡日期：（今天日期）
-✅ 今天完成：（第一題重點）
-🤔 遇到的卡關：（第二題，沒有就寫「無」）
-💪 今天的亮點：（第三題）
-🎯 明天目標：（第四題）
-
-最後給一句溫暖的話，不超過一行。`
-  },
-  onboard: {
-    name: '新人引導',
-    prompt: `你是漢柏分身，代表「貴焿古早味麵線羹」歡迎新人加入。
-
-現在進入「新人引導」模式。
-
-開場說：「歡迎加入貴焿！我是漢柏分身，接下來會陪你走過第一週。請問你的名字是？」
-
-取得名字後依序介紹（每段介紹完問有沒有問題）：
-
-1. 我們是誰：
-「貴焿古早味麵線羹，是一個重視人勝過重視業績的品牌。我們的核心是：幫人發展與提升人生方向，比賺大錢更重要。」
-
-2. 第一週任務清單：
-- 認識所有同事的名字
-- 了解自己負責的工作範圍
-- 第一次獨立完成一件小任務
-- 跟直屬主管進行一次一對一對話
-
-3. 遇到問題怎麼辦：
-「有問題先試著自己找，找不到再問同事，還是不確定就傳給我（回傳選單）。」
-
-最後問：「你現在有什麼想問的，或是有什麼擔心的事嗎？」
-根據回答回應，最後說：「第一天最重要的事，就是讓自己安心。加油，我們很高興你在這裡。」`
-  }
-};
-
-function buildSystemPrompt(skillPrompt, profile) {
-  if (!profile) return skillPrompt;
-  return `${skillPrompt}\n\n---\n【這位使用者的過去記憶】\n${profile}`;
+value 判斷：1-2=低（瑣事或可完全放手）、3=中（有價值但可訓練他人接手）、4-5=高（核心決策/戰略性，親自做才有意義）
+若歸類為「教得會」，reply 裡要點出「這個該寫成SOP」這個動作，不是只說可以教
+若完全看不出這是在做什麼事 → {"error":"無法辨識"}`,
+    messages: [{ role: 'user', content: text }]
+  });
+  try {
+    const raw = res.content[0].text.trim().replace(/^```(?:json)?|```$/g, '').trim();
+    return JSON.parse(raw);
+  } catch { return { error: '解析失敗' }; }
 }
 
-function getMenu() {
+async function recordWorkLog({ content, label, value, who, place, thing, reply }) {
+  if (!SUPABASE_URL) return false;
+  try {
+    const r = await dbFetch('hanbo_work_logs', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ content, label, value, who, place, thing, reply })
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+// ── 候選SOP追蹤（教得會事項重複達3次 → 觸發七何）──────────
+
+async function matchOrCreateSopCandidate(content, who, place) {
+  if (!SUPABASE_URL) return null;
+  try {
+    const res = await dbFetch('hanbo_sop_candidates?status=eq.pending&select=id,topic,count');
+    const candidates = await res.json();
+    const list = Array.isArray(candidates) ? candidates : [];
+
+    let matchedId = null;
+    let topic = content.slice(0, 20);
+    if (list.length) {
+      const namesStr = list.map(c => `${c.id}:${c.topic}`).join('\n');
+      const result = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 150,
+        system: `判斷這件新記錄的事，跟下面現有的「候選SOP主題」是不是同一件重複性工作（做法/情境相同即可，文字不用一樣）。只回傳 JSON，不要其他文字：
+{"matched_id":"符合的id，沒有符合則null","topic":"這件事的精簡主題名稱，10字內"}
+現有候選：\n${namesStr}`,
+        messages: [{ role: 'user', content: `新記錄：${content}${who ? `（人：${who}）` : ''}${place ? `（地：${place}）` : ''}` }]
+      });
+      try {
+        const parsed = JSON.parse(result.content[0].text.trim());
+        matchedId = parsed.matched_id || null;
+        if (parsed.topic) topic = parsed.topic;
+      } catch {}
+    }
+
+    if (matchedId) {
+      const existing = list.find(c => c.id === matchedId);
+      const newCount = (existing?.count || 1) + 1;
+      await dbFetch(`hanbo_sop_candidates?id=eq.${matchedId}`, {
+        method: 'PATCH',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ count: newCount, updated_at: new Date().toISOString() })
+      });
+      return { id: matchedId, topic: existing?.topic || topic, count: newCount };
+    }
+
+    const created = await dbFetch('hanbo_sop_candidates', {
+      method: 'POST',
+      headers: { Prefer: 'return=representation' },
+      body: JSON.stringify({ topic, count: 1 })
+    });
+    const data = await created.json();
+    return data[0] ? { id: data[0].id, topic: data[0].topic, count: 1 } : null;
+  } catch { return null; }
+}
+
+async function markSopCandidateStatus(id, status) {
+  if (!SUPABASE_URL || !id) return false;
+  try {
+    const r = await dbFetch(`hanbo_sop_candidates?id=eq.${id}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ status, updated_at: new Date().toISOString() })
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+async function listTriggeredSopCandidates() {
+  if (!SUPABASE_URL) return [];
+  try {
+    const res = await dbFetch('hanbo_sop_candidates?status=eq.triggered&select=id,topic,count&order=updated_at.desc');
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+const SEVEN_HE_QUESTIONS = [
+  { key: 'what',  label: '何事', ask: topic => `這件事「${topic}」，具體來說在做什麼？` },
+  { key: 'why',   label: '何因', ask: () => '為什麼要做這件事？不做的話會怎樣？' },
+  { key: 'who',   label: '何人', ask: () => '誰負責、誰需要配合？' },
+  { key: 'when',  label: '何時', ask: () => '什麼時機做、多久一次？' },
+  { key: 'where', label: '何地', ask: () => '在哪裡做、哪些店適用？' },
+  { key: 'how',   label: '何法', ask: () => '具體步驟是什麼？可以條列講。' },
+  { key: 'cost',  label: '何價', ask: () => '大概要花多少時間或成本？' }
+];
+
+function buildSopDraft(topic, answers) {
+  return `📋 SOP 草稿：${topic}
+
+【何事】${answers.what || '-'}
+【何因】${answers.why || '-'}
+【何人】${answers.who || '-'}
+【何時】${answers.when || '-'}
+【何地】${answers.where || '-'}
+【何法】
+${answers.how || '-'}
+【何價】${answers.cost || '-'}
+
+這份先幫你存起來了，確認沒問題的話複製貼到 sop.html，或傳「選單」結束。`;
+}
+
+async function fetchWorkLogs(sinceISO) {
+  if (!SUPABASE_URL) return [];
+  try {
+    const res = await dbFetch(`hanbo_work_logs?created_at=gte.${sinceISO}&order=created_at.asc`);
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+function topCounts(items, field, n = 3) {
+  const counts = {};
+  for (const it of items) {
+    const v = it[field];
+    if (!v) continue;
+    counts[v] = (counts[v] || 0) + 1;
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, n);
+}
+
+function buildWorklogSummary(logs, title) {
+  if (!logs.length) return `${title}\n\n這段期間沒有工事紀錄，是漏記了，還是真的都授權出去了？`;
+  const byLabel = { 教得會: [], 不該做: [], 親力親為: [] };
+  for (const l of logs) (byLabel[l.label] || byLabel.親力親為).push(l);
+  const pct = (n) => Math.round((n / logs.length) * 100);
+  const highValue = logs.filter(l => l.value >= 4).sort((a, b) => b.value - a.value).slice(0, 5);
+  const shouldStop = byLabel['不該做'].slice(0, 5);
+  const sopCandidates = byLabel.教得會.slice(0, 8);
+  const personalWho = topCounts(byLabel.親力親為, 'who');
+  const personalPlace = topCounts(byLabel.親力親為, 'place');
+
+  let msg = `${title}（共 ${logs.length} 筆）\n\n`;
+  msg += `📚 教得會：${byLabel.教得會.length} 筆（${pct(byLabel.教得會.length)}%）\n`;
+  msg += `🚫 不該做：${byLabel['不該做'].length} 筆（${pct(byLabel['不該做'].length)}%）\n`;
+  msg += `🔑 親力親為：${byLabel.親力親為.length} 筆（${pct(byLabel.親力親為.length)}%）\n`;
+
+  if (sopCandidates.length) {
+    msg += `\n📚 該寫成SOP／工作說明書（目前靠想到就做）：\n` + sopCandidates.map(l => `・${l.content}`).join('\n') + '\n';
+  }
+  if (highValue.length) {
+    msg += `\n⭐ 高價值事項：\n` + highValue.map(l => `・${l.content}`).join('\n') + '\n';
+  }
+  if (shouldStop.length) {
+    msg += `\n🚫 該考慮授權/停止：\n` + shouldStop.map(l => `・${l.content}`).join('\n') + '\n';
+  }
+  if (personalWho.length || personalPlace.length) {
+    msg += `\n🔎 由內而外看「親力親為」最常黏著誰／哪個地方：\n`;
+    if (personalWho.length) msg += `　人：` + personalWho.map(([w, c]) => `${w}(${c})`).join('、') + '\n';
+    if (personalPlace.length) msg += `　地：` + personalPlace.map(([p, c]) => `${p}(${c})`).join('、') + '\n';
+  }
+  return msg.trim();
+}
+
+function getMenu(userId) {
+  const isHanbo = HANBO_USER_ID && userId === HANBO_USER_ID;
   return `👋 你好！我是漢柏分身
 
 請選擇你需要的服務：
 
-1️⃣ 職涯對話
-想聊未來方向、卡關、或只是想被聽見
+1️⃣ 記帳 / 回報營業額
+傳一句話就能記錄，直接同步到門店日報表
 
-2️⃣ 每日學習打卡
-記錄今天的成長與明天的目標
-
-3️⃣ 新人引導
-剛加入貴焿的夥伴從這裡開始
-
-4️⃣ 記帳 / 回報營業額
-傳一句話就能記錄
-
-5️⃣ 展店紀錄
+2️⃣ 展店紀錄
 記一筆心得，累積這間店的經驗值
 
-6️⃣ 待辦任務清單
+3️⃣ 待辦任務清單
 查看目前未完成的任務
-
+${isHanbo ? `
+4️⃣ 每日工事
+做完一件事就丟給我，我幫你判斷該教會員工、不該做、還是只能你自己來
+` : ''}
 🎙️ 說語音 → 直接記錄任務
-✍️ 傳「任務 xxx」→ 文字新增任務
+✍️ 傳「任務 xxx」→ 文字新增任務${isHanbo ? '\n📋 傳「SOP」→ 整理累積到3次的教得會事項' : ''}
 
 輸入數字開始，或直接說語音`;
 }
@@ -400,16 +525,6 @@ async function pushToUser(userId, message) {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
     body: JSON.stringify({ to: userId, messages: [{ type: 'text', text: message }] })
   });
-}
-
-async function callClaude(systemPrompt, history, userMessage) {
-  const response = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 500,
-    system: systemPrompt,
-    messages: [...history, { role: 'user', content: userMessage }]
-  });
-  return response.content[0].text;
 }
 
 // ── Webhook ──────────────────────────────────────────
@@ -498,12 +613,12 @@ app.post('/webhook', async (req, res) => {
     console.log(`[${userId}] "${userText}"`);
     const replyToken = event.replyToken;
 
-    if (!sessions[userId]) sessions[userId] = { skill: null, history: [], profile: null, pendingImageUrl: null };
+    if (!sessions[userId]) sessions[userId] = { skill: null, pendingImageUrl: null, storeId: null, storeName: null, awaitingStore: false, storeChoices: null, sopStep: null, sopAnswers: null, sopTopic: null, sopCandidateId: null, awaitingSopChoice: false, sopChoices: null };
     const session = sessions[userId];
 
     // 圖片在非記帳／展店模式下提示
     if (isImage && session.skill !== 'finance' && session.skill !== 'storelog') {
-      await replyToLine(replyToken, '圖片記帳請先傳 4 進入記帳模式，或傳 5 進入展店紀錄模式，再拍照傳送。');
+      await replyToLine(replyToken, '圖片記帳請先傳 1 進入記帳模式，或傳 2 進入展店紀錄模式，再拍照傳送。');
       continue;
     }
 
@@ -520,7 +635,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ── 查看待辦 ──
-    if (userText === '6' || userText === '待辦' || userText === '任務清單') {
+    if (userText === '3' || userText === '待辦' || userText === '任務清單') {
       const tasks = await listPendingTasks();
       if (!tasks.length) {
         await replyToLine(replyToken, '目前沒有待辦任務 🎉\n\n說語音或傳「任務 xxx」新增');
@@ -537,14 +652,87 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    // ── 觸發七何寫SOP（只開放給執行長，資料來源是他自己的每日工事紀錄）──
+    if ((userText === 'SOP' || userText.toLowerCase() === 'sop' || userText === '七何') && !session.awaitingSopChoice && session.skill !== 'sopwrite') {
+      if (!HANBO_USER_ID || userId !== HANBO_USER_ID) {
+        await replyToLine(replyToken, getMenu(userId));
+        continue;
+      }
+      const triggered = await listTriggeredSopCandidates();
+      if (!triggered.length) {
+        await replyToLine(replyToken, '目前沒有累積到3次、等你寫SOP的事項。');
+      } else if (triggered.length === 1) {
+        session.skill = 'sopwrite';
+        session.sopCandidateId = triggered[0].id;
+        session.sopTopic = triggered[0].topic;
+        session.sopStep = 0;
+        session.sopAnswers = {};
+        await replyToLine(replyToken, `📋 開始整理「${session.sopTopic}」的SOP，用七何一題一題來。\n\n${SEVEN_HE_QUESTIONS[0].ask(session.sopTopic)}`);
+      } else {
+        session.awaitingSopChoice = true;
+        session.sopChoices = triggered;
+        const list = triggered.map((c, i) => `${i + 1}. ${c.topic}（出現${c.count}次）`).join('\n');
+        await replyToLine(replyToken, `有幾件事都到了該寫SOP的時候，先選一個：\n\n${list}`);
+      }
+      continue;
+    }
+
     // 回選單
     if (userText === '選單' || userText === 'menu' || userText === '0') {
-      if (session.skill && session.skill !== 'finance' && session.history.length > 2) {
-        updateProfile(userId, session.history, session.profile).catch(console.error);
-      }
-      sessions[userId] = { skill: null, history: [], profile: null, pendingImageUrl: null };
-      await replyToLine(replyToken, getMenu());
+      sessions[userId] = { skill: null, pendingImageUrl: null, storeId: null, storeName: null, awaitingStore: false, storeChoices: null, sopStep: null, sopAnswers: null, sopTopic: null, sopCandidateId: null, awaitingSopChoice: false, sopChoices: null };
+      await replyToLine(replyToken, getMenu(userId));
       continue;
+    }
+
+    // 換店（記帳模式用）
+    if (userText === '換店') {
+      session.storeId = null;
+      session.storeName = null;
+      if (session.skill === 'finance') {
+        const stores = await getAllowedStores(userId);
+        if (!stores.length) {
+          await replyToLine(replyToken, '你的 LINE 帳號還沒被設定可以記哪一家店的帳，請聯絡漢柏幫你綁定。');
+          session.skill = null;
+          continue;
+        }
+        session.storeChoices = stores;
+        session.awaitingStore = true;
+        const list = stores.map((s, i) => `${i + 1}. ${s.name}`).join('\n');
+        await replyToLine(replyToken, `要換記哪一家店的日報？\n\n${list}`);
+      } else {
+        await replyToLine(replyToken, '已重設店家，下次進記帳模式會重新讓你選。');
+      }
+      continue;
+    }
+
+    // ── 記帳模式：選店 ──
+    if (session.skill === 'finance' && session.awaitingStore) {
+      const idx = parseInt(userText, 10) - 1;
+      const choice = (session.storeChoices || [])[idx];
+      if (!choice) {
+        const list = session.storeChoices.map((s, i) => `${i + 1}. ${s.name}`).join('\n');
+        await replyToLine(replyToken, `請輸入店家編號：\n\n${list}`);
+        continue;
+      }
+      session.storeId = choice.id;
+      session.storeName = choice.name;
+      session.awaitingStore = false;
+      await replyToLine(replyToken, `✅ 之後記帳都記到「${choice.name}」\n\n直接傳就好，例如：\n「午餐 金園排骨 260」\n「今日營業額 18500」\n「停車費 80」\n\n要換店傳「換店」，傳「選單」結束`);
+      continue;
+    }
+
+    // ── 卡在某個模式時，輸入其他模式的關鍵字直接切換，不用先傳「選單」──
+    // （這是2026-08-11晚上漢柏真的卡住3小時的原因：待在worklog模式時打「記帳」，
+    // 因為選擇技能的關鍵字判斷只在 session.skill 是 null 時才會跑到，結果被當成工事內容送去分類）
+    if (session.skill === 'finance' || session.skill === 'storelog' || session.skill === 'worklog') {
+      const switchingAway =
+        (session.skill !== 'finance'  && (userText === '1' || userText.includes('記帳') || userText.includes('營業額'))) ||
+        (session.skill !== 'storelog' && (userText === '2' || userText.includes('展店'))) ||
+        (session.skill !== 'worklog'  && (userText === '4' || userText.includes('工事')));
+      if (switchingAway) {
+        session.skill = null;
+        session.awaitingStore = false;
+      }
     }
 
     // ── 記帳模式（不需要對話歷史）──
@@ -556,11 +744,11 @@ app.post('/webhook', async (req, res) => {
         if (parsed.error) {
           await replyToLine(replyToken, `無法辨識，請試試：\n「午餐 260」\n「今日營業額 15000」\n\n或傳「選單」結束`);
         } else if (parsed.type === 'revenue') {
-          await recordRevenue(userId, parsed.amount, parsed.description);
-          await replyToLine(replyToken, `💰 已記錄營業額 $${Number(parsed.amount).toLocaleString()}\n${parsed.description ? `（${parsed.description}）` : ''}\n\n繼續傳下一筆，或傳「選單」結束`);
+          await recordDailyRevenue(session.storeId, parsed.amount);
+          await replyToLine(replyToken, `💰 已記錄「${session.storeName}」今日營業額 $${Number(parsed.amount).toLocaleString()}\n已同步到日報表\n\n繼續傳下一筆，或傳「選單」結束`);
         } else {
-          await recordExpense(userId, parsed.amount, parsed.category, parsed.description);
-          await replyToLine(replyToken, `✅ ${parsed.description} $${parsed.amount}\n分類：${parsed.category}\n\n繼續傳下一筆，或傳「選單」結束`);
+          await recordDailyExpense(session.storeId, parsed.amount, parsed.category, parsed.description);
+          await replyToLine(replyToken, `✅ 「${session.storeName}」支出 ${parsed.description} $${parsed.amount}\n分類：${parsed.category}\n已同步到日報表\n\n繼續傳下一筆，或傳「選單」結束`);
         }
       } catch (err) {
         console.error(err);
@@ -606,70 +794,169 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
-    // 選擇技能
-    if (!session.skill) {
-      if (userText === '1' || userText.includes('職涯')) {
-        session.skill = 'career';
-      } else if (userText === '2' || userText.includes('打卡')) {
-        session.skill = 'checkin';
-      } else if (userText === '3' || userText.includes('新人')) {
-        session.skill = 'onboard';
-      } else if (userText === '4' || userText.includes('記帳') || userText.includes('營業額')) {
-        session.skill = 'finance';
-        await replyToLine(replyToken, `📒 記帳模式開啟\n\n直接傳就好，例如：\n「午餐 金園排骨 260」\n「今日營業額 18500」\n「停車費 80」\n\n傳「選單」結束記帳`);
-        continue;
-      } else if (userText === '5' || userText.includes('展店')) {
-        session.skill = 'storelog';
-        await replyToLine(replyToken, `🏪 展店紀錄模式開啟\n\n直接傳心得就好，例如：\n「三民店 選址 巷口那間租金太高，以後要抓預算上限」\n「新開的左營店 人事 找到超讚的店長」\n\n傳「選單」結束`);
-        continue;
-      } else {
-        await replyToLine(replyToken, getMenu());
-        continue;
-      }
-
-      session.profile = await loadProfile(userId);
-      const skill = SKILLS[session.skill];
+    // ── 每日工事模式（不需要對話歷史）──
+    if (session.skill === 'worklog') {
       try {
-        const opening = await callClaude(buildSystemPrompt(skill.prompt, session.profile), [], '請開始');
-        session.history = [
-          { role: 'user', content: '請開始' },
-          { role: 'assistant', content: opening }
-        ];
-        await replyToLine(replyToken, opening);
+        const parsed = await parseWorkLog(userText);
+        if (parsed.error) {
+          await replyToLine(replyToken, `無法辨識，請直接說做了什麼，例如：\n「跟廠商確認三民店的工期」\n\n或傳「選單」結束`);
+        } else {
+          const ok = await recordWorkLog({
+            content: userText,
+            label: parsed.label,
+            value: parsed.value,
+            who: parsed.who || null,
+            place: parsed.place || null,
+            thing: parsed.thing || null,
+            reply: parsed.reply
+          });
+          if (ok) {
+            const tags = [parsed.who, parsed.place, parsed.thing].filter(Boolean);
+            const tagLine = tags.length ? `\n👤${parsed.who || '-'} 📍${parsed.place || '-'} 📦${parsed.thing || '-'}` : '';
+            let nudge = '';
+            if (parsed.label === '教得會') {
+              const candidate = await matchOrCreateSopCandidate(userText, parsed.who, parsed.place);
+              if (candidate && candidate.count >= 3) {
+                await markSopCandidateStatus(candidate.id, 'triggered');
+                nudge = `\n\n🔔 「${candidate.topic}」這件事已經出現第 ${candidate.count} 次了，要不要現在花幾分鐘走一輪七何，把它寫成SOP？\n傳「SOP」開始，或晚點再說`;
+              }
+            }
+            await replyToLine(replyToken, `${parsed.label}｜價值 ${parsed.value}/5${tagLine}\n${parsed.reply}\n\n繼續傳下一件，或傳「選單」結束${nudge}`);
+          } else {
+            await replyToLine(replyToken, '記錄失敗，請再試一次。');
+          }
+        }
       } catch (err) {
-        console.error('技能開場失敗:', err);
-        session.skill = null;
-        await replyToLine(replyToken, '抱歉，啟動失敗，請再試一次。');
+        console.error(err);
+        await replyToLine(replyToken, '記錄失敗，請再試一次。');
       }
       continue;
     }
 
-    // 繼續對話
-    const skill = SKILLS[session.skill];
-    try {
-      const reply = await callClaude(buildSystemPrompt(skill.prompt, session.profile), session.history, userText);
-      session.history.push({ role: 'user', content: userText });
-      session.history.push({ role: 'assistant', content: reply });
-      if (session.history.length > 20) session.history = session.history.slice(-20);
-      if (session.history.length % 8 === 0) {
-        updateProfile(userId, session.history, session.profile)
-          .then(p => { session.profile = p; })
-          .catch(console.error);
+    // ── 選擇要寫哪個SOP ──
+    if (session.awaitingSopChoice) {
+      const idx = parseInt(userText, 10) - 1;
+      const choice = (session.sopChoices || [])[idx];
+      if (!choice) {
+        const list = session.sopChoices.map((c, i) => `${i + 1}. ${c.topic}（出現${c.count}次）`).join('\n');
+        await replyToLine(replyToken, `請輸入編號：\n\n${list}`);
+        continue;
       }
-      await replyToLine(replyToken, reply);
-    } catch (err) {
-      console.error(err);
-      await replyToLine(replyToken, '抱歉，我剛才沒跟上，可以再說一次嗎？');
+      session.awaitingSopChoice = false;
+      session.sopChoices = null;
+      session.skill = 'sopwrite';
+      session.sopCandidateId = choice.id;
+      session.sopTopic = choice.topic;
+      session.sopStep = 0;
+      session.sopAnswers = {};
+      await replyToLine(replyToken, `📋 開始整理「${session.sopTopic}」的SOP，用七何一題一題來。\n\n${SEVEN_HE_QUESTIONS[0].ask(session.sopTopic)}`);
+      continue;
+    }
+
+    // ── 七何寫SOP進行中 ──
+    if (session.skill === 'sopwrite') {
+      const q = SEVEN_HE_QUESTIONS[session.sopStep];
+      session.sopAnswers[q.key] = userText;
+      session.sopStep += 1;
+      if (session.sopStep < SEVEN_HE_QUESTIONS.length) {
+        await replyToLine(replyToken, SEVEN_HE_QUESTIONS[session.sopStep].ask(session.sopTopic));
+      } else {
+        const draft = buildSopDraft(session.sopTopic, session.sopAnswers);
+        await markSopCandidateStatus(session.sopCandidateId, 'done');
+        session.skill = null;
+        session.sopCandidateId = null;
+        session.sopAnswers = null;
+        session.sopStep = null;
+        await replyToLine(replyToken, draft);
+      }
+      continue;
+    }
+
+    // 選擇技能
+    if (!session.skill) {
+      if (userText === '1' || userText.includes('記帳') || userText.includes('營業額')) {
+        session.skill = 'finance';
+        const stores = await getAllowedStores(userId);
+        if (!stores.length) {
+          await replyToLine(replyToken, '你的 LINE 帳號還沒被設定可以記哪一家店的帳，請聯絡漢柏幫你綁定。');
+          session.skill = null;
+          continue;
+        }
+        session.storeChoices = stores;
+        session.awaitingStore = true;
+        const list = stores.map((s, i) => `${i + 1}. ${s.name}`).join('\n');
+        await replyToLine(replyToken, `📒 記帳模式開啟\n\n先選要記哪一家店的日報：\n\n${list}`);
+        continue;
+      } else if (userText === '2' || userText.includes('展店')) {
+        session.skill = 'storelog';
+        await replyToLine(replyToken, `🏪 展店紀錄模式開啟\n\n直接傳心得就好，例如：\n「三民店 選址 巷口那間租金太高，以後要抓預算上限」\n「新開的左營店 人事 找到超讚的店長」\n\n傳「選單」結束`);
+        continue;
+      } else if (userText === '4' || userText.includes('工事')) {
+        if (!HANBO_USER_ID || userId !== HANBO_USER_ID) {
+          await replyToLine(replyToken, getMenu(userId));
+          continue;
+        }
+        session.skill = 'worklog';
+        await replyToLine(replyToken, `🗂️ 每日工事模式開啟\n\n做完一件事就傳給我，我幫你判斷「教得會 / 不該做 / 親力親為」跟價值分，月底季底會彙整成報告給你。\n\n例如：「跟廠商確認三民店的工期」\n\n傳「選單」結束`);
+        continue;
+      } else {
+        await replyToLine(replyToken, getMenu(userId));
+        continue;
+      }
     }
   }
 });
 
 // ── 定時推播 ──────────────────────────────────────────
 
+// 每月 1 號早上彙整上個月的每日工事紀錄，季底月份（1/4/7/10月）額外彙整上一季
+cron.schedule('30 8 1 * *', async () => {
+  if (!HANBO_USER_ID) return;
+  try {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const monthEnd = new Date(now.getFullYear(), now.getMonth(), 1);
+    const monthLogs = (await fetchWorkLogs(monthStart.toISOString()))
+      .filter(l => new Date(l.created_at) < monthEnd);
+    const monthLabel = `${monthStart.getFullYear()}/${monthStart.getMonth() + 1} 月`;
+    await pushToUser(HANBO_USER_ID, buildWorklogSummary(monthLogs, `📊 ${monthLabel}工事彙整`));
 
-cron.schedule('30 21 * * *', async () => {
-  const msg = `🌙 今天結束前，記得打個卡。\n\n傳 2 給我，花 2 分鐘記錄今天的收穫。`;
-  for (const uid of pushUserIds) await pushToUser(uid, msg);
+    if ([0, 3, 6, 9].includes(now.getMonth())) {
+      const qStart = new Date(now.getFullYear(), now.getMonth() - 3, 1);
+      const qLogs = (await fetchWorkLogs(qStart.toISOString()))
+        .filter(l => new Date(l.created_at) < monthEnd);
+      const qLabel = `${qStart.getFullYear()} Q${Math.floor(qStart.getMonth() / 3) + 1}`;
+      await pushToUser(HANBO_USER_ID, buildWorklogSummary(qLogs, `📈 ${qLabel} 工事彙整`));
+    }
+  } catch (err) {
+    console.error('工事彙整推播失敗:', err);
+  }
+}, { timezone: 'Asia/Taipei' });
+
+// 每天早上彙整昨日各店日報回報進度 + 待辦數量
+cron.schedule('0 8 * * *', async () => {
+  if (!HANBO_USER_ID) return;
+  try {
+    await pushToUser(HANBO_USER_ID, await buildDailySummary());
+  } catch (err) {
+    console.error('每日摘要推播失敗:', err);
+  }
+}, { timezone: 'Asia/Taipei' });
+
+// 每月 27 號提醒填自我盤點表，時間點卡在月底前，讓店長反思的是「這個月」，
+// 剛好接上 8/1 那份評論月報回顧的也是同一個月份。
+// 目前還沒有店長版的 LINE ID 名冊，所以先推給漢柏，由他轉發到店長群組；
+// 之後有 supervisor_users 擴充成完整名冊，可以改成直接推給每位店長。
+const SELF_CHECKIN_FORM_URL = 'https://docs.google.com/forms/d/180kvI7K1QHeciS4WJQ-A1dfV52N165xXJ0h4F6RtD70/viewform';
+cron.schedule('0 10 27 * *', async () => {
+  if (!HANBO_USER_ID) return;
+  try {
+    await pushToUser(HANBO_USER_ID,
+      `📝 該提醒店長們填「自我盤點表」了\n\n這個月快結束了，麻煩轉發給店長群組，請大家花幾分鐘回顧這個月：\n${SELF_CHECKIN_FORM_URL}`
+    );
+  } catch (err) {
+    console.error('自我盤點表提醒推播失敗:', err);
+  }
 }, { timezone: 'Asia/Taipei' });
 
 const PORT = process.env.PORT || 3000;
