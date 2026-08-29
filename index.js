@@ -195,8 +195,8 @@ async function getAllowedStores(userId) {
 
 async function buildDailySummary() {
   // 只看「昨天有沒有回報」在門店都是隔幾天一次補登記的情況下幾乎天天都亮紅字，沒有意義。
-  // 改成看「每間店實際填到哪一天、落後幾天」＋「昨天送出的資料本身有沒有明顯異常」，
-  // 兩者都是稽核左大店資料時發現真的會出錯、值得每天盯的東西（漏填、重複記帳）。
+  // 改成看「每間店實際填到哪一天、落後幾天」＋「這半個月資料本身有沒有明顯異常」，
+  // 兩者都是稽核左大店資料時發現真的會出錯、值得盯的東西（漏填、重複記帳）。
   const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
   const lookbackDate = new Date(Date.now() - 14 * 86400000).toISOString().split('T')[0];
   const stores = await getOperatingStores();
@@ -207,7 +207,9 @@ async function buildDailySummary() {
 
   if (stores.length) {
     try {
-      const res = await dbFetch(`store_daily_report?date=gte.${lookbackDate}&select=store_id,date,cash_counted,morning_revenue,evening_revenue,line_pay,uber_amount,foodpanda_amount&order=date.asc`);
+      // 「填到哪天」只看到昨天為止——不然店家萬一提早填了今天（甚至填錯未來日期），
+      // 會被誤判成「進度超前」，反而把選錯日期這種真的出過的錯蓋掉。
+      const res = await dbFetch(`store_daily_report?date=gte.${lookbackDate}&date=lte.${yesterday}&select=store_id,date,is_rest_day,cash_counted,morning_revenue,evening_revenue,line_pay,uber_amount,foodpanda_amount&order=date.asc`);
       const rows = await res.json();
       const byStore = {};
       (Array.isArray(rows) ? rows : []).forEach(r => {
@@ -232,21 +234,10 @@ async function buildDailySummary() {
       if (never.length) progressParts.push(`🚫 近14天沒填：${never.join('、')}`);
       progressMsg = progressParts.join('\n');
 
-      // 異常檢查只看「有回報昨天」的店，資料本身合不合理
-      const y = {};
-      (byStore ? Object.entries(byStore) : []).forEach(([storeId, list]) => {
+      // 漏填檢查只看昨天（当天没填完整才需要提醒），店休的天數本來就該是空的，跳過不算漏填
+      Object.entries(byStore).forEach(([storeId, list]) => {
         const row = list.find(r => r.date === yesterday);
-        if (row) y[storeId] = row;
-      });
-
-      const expRes = await dbFetch(`store_daily_expenses?date=eq.${yesterday}&select=store_id,vendor_name,description,amount`);
-      const expRows = await expRes.json();
-      const expByStore = {};
-      (Array.isArray(expRows) ? expRows : []).forEach(e => {
-        (expByStore[e.store_id] = expByStore[e.store_id] || []).push(e);
-      });
-
-      Object.entries(y).forEach(([storeId, row]) => {
+        if (!row || row.is_rest_day) return;
         const store = stores.find(s => s.id === storeId);
         if (!store) return;
         // cash_counted 只有網頁完整日報表才會填，LINE 只回報營業額的話這欄一定是空的
@@ -255,13 +246,32 @@ async function buildDailySummary() {
         } else if (!row.morning_revenue && !row.evening_revenue && !row.line_pay && !row.uber_amount && !row.foodpanda_amount) {
           anomalyLines.push(`${store.name}：有送出日報但營收欄位全空，疑似漏填`);
         }
+      });
+
+      // 重複記帳檢查看「這半個月」（1-15或16-月底，過15號就算下半月，跟毛利結算頁同一套切法），
+      // 只看昨天的話，稽核左大店/三民建工店查到的舊重複記帳過一天就再也不會被提醒。
+      const today = new Date();
+      const day = today.getDate();
+      const y = today.getFullYear(), m = today.getMonth();
+      const periodStart = day <= 15 ? new Date(y, m, 1) : new Date(y, m, 16);
+      const periodStartStr = periodStart.toISOString().split('T')[0];
+      const expRes = await dbFetch(`store_daily_expenses?date=gte.${periodStartStr}&date=lte.${yesterday}&select=store_id,vendor_name,description,amount,date`);
+      const expRows = await expRes.json();
+      const expByStore = {};
+      (Array.isArray(expRows) ? expRows : []).forEach(e => {
+        (expByStore[e.store_id] = expByStore[e.store_id] || []).push(e);
+      });
+      Object.entries(expByStore).forEach(([storeId, list]) => {
+        const store = stores.find(s => s.id === storeId);
+        if (!store) return;
         const seen = {};
-        (expByStore[storeId] || []).forEach(e => {
-          const key = `${e.vendor_name || e.description}_${e.amount}`;
-          seen[key] = (seen[key] || 0) + 1;
+        list.forEach(e => {
+          const key = `${e.date}_${e.vendor_name || e.description}_${e.amount}`;
+          (seen[key] = seen[key] || []).push(e);
         });
-        Object.entries(seen).filter(([, c]) => c > 1).forEach(([key, c]) => {
-          anomalyLines.push(`${store.name}：${key.split('_')[0]} $${key.split('_')[1]} 出現${c}次，疑似重複記帳`);
+        Object.entries(seen).filter(([, l]) => l.length > 1).forEach(([key, l]) => {
+          const [date, name] = key.split('_');
+          anomalyLines.push(`${store.name}：${date.slice(5)} ${name} $${l[0].amount} 出現${l.length}次，疑似重複記帳`);
         });
       });
     } catch (err) {
@@ -271,7 +281,7 @@ async function buildDailySummary() {
   }
 
   let msg = `☀️ 早安，今天的營運摘要\n\n📅 各店回報進度：\n${progressMsg}`;
-  if (anomalyLines.length) msg += `\n\n🔍 昨天資料異常：\n${anomalyLines.join('\n')}`;
+  if (anomalyLines.length) msg += `\n\n🔍 資料異常：\n${anomalyLines.join('\n')}`;
   msg += `\n\n📋 待辦 Inbox：${tasks.length} 件待處理`;
   msg += `\n\n🔗 詳細日報：https://ijs7594.github.io/daily-report.html`;
   return msg;
