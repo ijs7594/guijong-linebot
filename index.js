@@ -194,26 +194,86 @@ async function getAllowedStores(userId) {
 }
 
 async function buildDailySummary() {
+  // 只看「昨天有沒有回報」在門店都是隔幾天一次補登記的情況下幾乎天天都亮紅字，沒有意義。
+  // 改成看「每間店實際填到哪一天、落後幾天」＋「昨天送出的資料本身有沒有明顯異常」，
+  // 兩者都是稽核左大店資料時發現真的會出錯、值得每天盯的東西（漏填、重複記帳）。
   const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+  const lookbackDate = new Date(Date.now() - 14 * 86400000).toISOString().split('T')[0];
   const stores = await getOperatingStores();
-  let notReported = [];
-  try {
-    const res = await dbFetch(`store_daily_report?date=eq.${yesterday}&select=store_id`);
-    const reported = await res.json();
-    const reportedIds = new Set((Array.isArray(reported) ? reported : []).map(r => r.store_id));
-    notReported = stores.filter(s => !reportedIds.has(s.id)).map(s => s.name);
-  } catch {}
   const tasks = await listPendingTasks();
 
-  let msg = `☀️ 早安，今天的營運摘要\n\n📅 昨天（${yesterday}）日報回報：`;
-  if (!stores.length) {
-    msg += '目前沒有營運中門店資料';
-  } else if (!notReported.length) {
-    msg += `全數 ${stores.length} 間門店都已回報 ✅`;
-  } else {
-    msg += `${stores.length - notReported.length}/${stores.length} 間已回報\n未回報：${notReported.join('、')}`;
+  let progressMsg = '目前沒有營運中門店資料';
+  let anomalyLines = [];
+
+  if (stores.length) {
+    try {
+      const res = await dbFetch(`store_daily_report?date=gte.${lookbackDate}&select=store_id,date,cash_counted,morning_revenue,evening_revenue,line_pay,uber_amount,foodpanda_amount&order=date.asc`);
+      const rows = await res.json();
+      const byStore = {};
+      (Array.isArray(rows) ? rows : []).forEach(r => {
+        (byStore[r.store_id] = byStore[r.store_id] || []).push(r);
+      });
+
+      const behind = [];
+      const never = [];
+      let onTrackCount = 0;
+      stores.forEach(s => {
+        const list = byStore[s.id] || [];
+        if (!list.length) { never.push(s.name); return; }
+        const latest = list[list.length - 1].date;
+        const gap = Math.round((new Date(yesterday) - new Date(latest)) / 86400000);
+        if (gap <= 0) onTrackCount++;
+        else behind.push(`${s.name}（填到${latest.slice(5)}，落後${gap}天）`);
+      });
+
+      const progressParts = [];
+      if (onTrackCount) progressParts.push(`✅ 跟上進度：${onTrackCount}/${stores.length} 間`);
+      if (behind.length) progressParts.push(`⚠️ 落後：${behind.join('、')}`);
+      if (never.length) progressParts.push(`🚫 近14天沒填：${never.join('、')}`);
+      progressMsg = progressParts.join('\n');
+
+      // 異常檢查只看「有回報昨天」的店，資料本身合不合理
+      const y = {};
+      (byStore ? Object.entries(byStore) : []).forEach(([storeId, list]) => {
+        const row = list.find(r => r.date === yesterday);
+        if (row) y[storeId] = row;
+      });
+
+      const expRes = await dbFetch(`store_daily_expenses?date=eq.${yesterday}&select=store_id,vendor_name,description,amount`);
+      const expRows = await expRes.json();
+      const expByStore = {};
+      (Array.isArray(expRows) ? expRows : []).forEach(e => {
+        (expByStore[e.store_id] = expByStore[e.store_id] || []).push(e);
+      });
+
+      Object.entries(y).forEach(([storeId, row]) => {
+        const store = stores.find(s => s.id === storeId);
+        if (!store) return;
+        // cash_counted 只有網頁完整日報表才會填，LINE 只回報營業額的話這欄一定是空的
+        if (row.cash_counted === null) {
+          anomalyLines.push(`${store.name}：只回報營業額，資料不全`);
+        } else if (!row.morning_revenue && !row.evening_revenue && !row.line_pay && !row.uber_amount && !row.foodpanda_amount) {
+          anomalyLines.push(`${store.name}：有送出日報但營收欄位全空，疑似漏填`);
+        }
+        const seen = {};
+        (expByStore[storeId] || []).forEach(e => {
+          const key = `${e.vendor_name || e.description}_${e.amount}`;
+          seen[key] = (seen[key] || 0) + 1;
+        });
+        Object.entries(seen).filter(([, c]) => c > 1).forEach(([key, c]) => {
+          anomalyLines.push(`${store.name}：${key.split('_')[0]} $${key.split('_')[1]} 出現${c}次，疑似重複記帳`);
+        });
+      });
+    } catch (err) {
+      console.error('每日摘要計算失敗:', err);
+      progressMsg = '進度計算失敗，稍後查看日報表確認';
+    }
   }
+
+  let msg = `☀️ 早安，今天的營運摘要\n\n📅 各店回報進度：\n${progressMsg}`;
+  if (anomalyLines.length) msg += `\n\n🔍 昨天資料異常：\n${anomalyLines.join('\n')}`;
   msg += `\n\n📋 待辦 Inbox：${tasks.length} 件待處理`;
+  msg += `\n\n🔗 詳細日報：https://ijs7594.github.io/daily-report.html`;
   return msg;
 }
 
@@ -518,19 +578,27 @@ function verifySignature(body, signature) {
 }
 
 async function replyToLine(replyToken, message) {
-  await fetch('https://api.line.me/v2/bot/message/reply', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
-    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text: message }] })
-  });
+  try {
+    await fetch('https://api.line.me/v2/bot/message/reply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+      body: JSON.stringify({ replyToken, messages: [{ type: 'text', text: message }] })
+    });
+  } catch (err) {
+    console.error('回覆 LINE 失敗:', err);
+  }
 }
 
 async function pushToUser(userId, message) {
-  await fetch('https://api.line.me/v2/bot/message/push', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
-    body: JSON.stringify({ to: userId, messages: [{ type: 'text', text: message }] })
-  });
+  try {
+    await fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+      body: JSON.stringify({ to: userId, messages: [{ type: 'text', text: message }] })
+    });
+  } catch (err) {
+    console.error('推播 LINE 失敗:', err);
+  }
 }
 
 // ── Webhook ──────────────────────────────────────────
@@ -583,6 +651,46 @@ app.post('/api/notify', async (req, res) => {
   }
 });
 
+// 待辦在網頁上被標記完成時，inbox.html 會打這支 API，
+// 讓「待辦」跟「每日工事」共用同一套 AI 判斷跟同一張紀錄表，不用漢柏自己再輸入一次。
+app.post('/api/task-completed', async (req, res) => {
+  if (!NOTIFY_SECRET || req.body.secret !== NOTIFY_SECRET) return res.status(403).send('forbidden');
+  const content = (req.body.content || '').trim();
+  if (!content) return res.status(400).send('缺少 content');
+  res.send('ok');
+
+  if (!HANBO_USER_ID) return;
+  try {
+    const parsed = await parseWorkLog(content);
+    if (parsed.error) return;
+
+    const ok = await recordWorkLog({
+      content,
+      label: parsed.label,
+      value: parsed.value,
+      who: parsed.who || null,
+      place: parsed.place || null,
+      thing: parsed.thing || null,
+      reply: parsed.reply
+    });
+    if (!ok) return;
+
+    const tags = [parsed.who, parsed.place, parsed.thing].filter(Boolean);
+    const tagLine = tags.length ? `\n👤${parsed.who || '-'} 📍${parsed.place || '-'} 📦${parsed.thing || '-'}` : '';
+    let nudge = '';
+    if (parsed.label === '教得會') {
+      const candidate = await matchOrCreateSopCandidate(content, parsed.who, parsed.place);
+      if (candidate && candidate.count >= 3) {
+        await markSopCandidateStatus(candidate.id, 'triggered');
+        nudge = `\n\n🔔 「${candidate.topic}」這件事已經出現第 ${candidate.count} 次了，要不要花幾分鐘走一輪七何，把它寫成SOP？\n傳「SOP」開始，或晚點再說`;
+      }
+    }
+    await pushToUser(HANBO_USER_ID, `✅ 待辦完成，順便幫你歸類了：\n「${content}」\n\n${parsed.label}｜價值 ${parsed.value}/5${tagLine}\n${parsed.reply}${nudge}`);
+  } catch (err) {
+    console.error('任務完成自動歸類失敗:', err);
+  }
+});
+
 app.post('/webhook', async (req, res) => {
   const signature = req.headers['x-line-signature'];
   if (!verifySignature(req.rawBody, signature)) return res.status(403).send('Invalid signature');
@@ -594,6 +702,9 @@ app.post('/webhook', async (req, res) => {
     const isText  = event.message.type === 'text';
     const isAudio = event.message.type === 'audio';
     if (!isText && !isImage && !isAudio) continue;
+
+    const userId = event.source.userId;
+    const replyToken = event.replyToken;
 
     // ── 語音訊息 → 直接存任務 ──
     if (isAudio) {
@@ -612,12 +723,10 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
-    const userId = event.source.userId;
     const userText = isText
       ? event.message.text.trim().replace(/[！-～]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
       : '[圖片]';
     console.log(`[${userId}] "${userText}"`);
-    const replyToken = event.replyToken;
 
     if (!sessions[userId]) sessions[userId] = { skill: null, pendingImageUrl: null, storeId: null, storeName: null, awaitingStore: false, storeChoices: null, sopStep: null, sopAnswers: null, sopTopic: null, sopCandidateId: null, awaitingSopChoice: false, sopChoices: null };
     const session = sessions[userId];
@@ -690,6 +799,29 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    // ── 卡在某個模式（含選店中／寫SOP中）時，輸入其他模式的關鍵字直接切換，不用先傳「選單」──
+    // （2026-08-11晚上漢柏真的卡住3小時的原因：待在worklog模式時打「記帳」，
+    // 因為選擇技能的關鍵字判斷只在 session.skill 是 null 時才會跑到，結果被當成工事內容送去分類。
+    // 這裡要涵蓋所有「忙碌中」狀態，包含選店中／寫SOP中，不然同一種卡法會在別的模式重演）
+    const busy = session.skill === 'finance' || session.skill === 'storelog' || session.skill === 'worklog'
+      || session.skill === 'sopwrite' || session.awaitingSopChoice;
+    if (busy) {
+      const switchingAway =
+        (session.skill !== 'finance'  && (userText === '1' || userText.includes('記帳') || userText.includes('營業額'))) ||
+        (session.skill !== 'storelog' && (userText === '2' || userText.includes('展店'))) ||
+        (session.skill !== 'worklog'  && (userText === '4' || userText.includes('工事')));
+      if (switchingAway) {
+        session.skill = null;
+        session.awaitingStore = false;
+        session.awaitingSopChoice = false;
+        session.sopChoices = null;
+        session.sopStep = null;
+        session.sopAnswers = null;
+        session.sopTopic = null;
+        session.sopCandidateId = null;
+      }
+    }
+
     // 換店（記帳模式用）
     if (userText === '換店') {
       session.storeId = null;
@@ -725,20 +857,6 @@ app.post('/webhook', async (req, res) => {
       session.awaitingStore = false;
       await replyToLine(replyToken, `✅ 之後記帳都記到「${choice.name}」\n\n直接傳就好，例如：\n「午餐 金園排骨 260」\n「今日營業額 18500」\n「停車費 80」\n\n要換店傳「換店」，傳「選單」結束`);
       continue;
-    }
-
-    // ── 卡在某個模式時，輸入其他模式的關鍵字直接切換，不用先傳「選單」──
-    // （這是2026-08-11晚上漢柏真的卡住3小時的原因：待在worklog模式時打「記帳」，
-    // 因為選擇技能的關鍵字判斷只在 session.skill 是 null 時才會跑到，結果被當成工事內容送去分類）
-    if (session.skill === 'finance' || session.skill === 'storelog' || session.skill === 'worklog') {
-      const switchingAway =
-        (session.skill !== 'finance'  && (userText === '1' || userText.includes('記帳') || userText.includes('營業額'))) ||
-        (session.skill !== 'storelog' && (userText === '2' || userText.includes('展店'))) ||
-        (session.skill !== 'worklog'  && (userText === '4' || userText.includes('工事')));
-      if (switchingAway) {
-        session.skill = null;
-        session.awaitingStore = false;
-      }
     }
 
     // ── 記帳模式（不需要對話歷史）──
