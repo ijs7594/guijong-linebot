@@ -777,6 +777,62 @@ exp 判斷：小發現/小提醒=15，一般心得/收穫=30，重大突破/重�
   }
 });
 
+app.post('/api/parse-daily-report-photo', async (req, res) => {
+  const { image_base64, media_type, year, month } = req.body;
+  if (!image_base64 || !year || !month) return res.status(400).json({ error: '缺少必要參數' });
+  try {
+    const result = await anthropic.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: 2000,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: media_type || 'image/jpeg', data: image_base64 }
+          },
+          {
+            type: 'text',
+            text: `這是一張手寫日報表照片，${year}年${month}月的資料。
+
+欄位說明（由左到右）：
+日（幾號）、客數、現金（現金營收）、Line Pay、貸放支出（不是營收，跳過）、理費支出（跳過）、總營收（可忽略，用其他欄算）、鍋數、熊貓（foodpanda）、UBER、現金實存（實際盤點現金）、零錢
+
+請將每一行解析成 JSON，只回傳以下格式，不要其他文字：
+{
+  "rows": [
+    {
+      "day": 1,
+      "customers": 38,
+      "cash": 23077,
+      "line_pay": 1980,
+      "uber": 1551,
+      "foodpanda": 1831,
+      "cash_counted": 2300,
+      "change": 77,
+      "pots": 13
+    }
+  ]
+}
+
+注意：
+- day 是號數（1~31）
+- 看不清楚的格子填 null
+- 只解析有資料的行，空白行跳過
+- 數字不要有逗號`
+          }
+        ]
+      }]
+    });
+    const raw = result.content[0].text.trim().replace(/^```(?:json)?|```$/gm, '').trim();
+    const parsed = JSON.parse(raw);
+    res.json(parsed);
+  } catch (err) {
+    console.error('parse-daily-report-photo error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/notify', async (req, res) => {
   if (!NOTIFY_SECRET || req.body.secret !== NOTIFY_SECRET) return res.status(403).send('forbidden');
   const message = (req.body.message || '').trim();
