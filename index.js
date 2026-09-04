@@ -258,20 +258,22 @@ async function buildDailySummary() {
         (byStore[r.store_id] = byStore[r.store_id] || []).push(r);
       });
 
+      const onTrack = [];
       const behind = [];
       const never = [];
-      let onTrackCount = 0;
       stores.forEach(s => {
         const list = byStore[s.id] || [];
         if (!list.length) { never.push(s.name); return; }
         const latest = list[list.length - 1].date;
         const gap = Math.round((new Date(yesterday) - new Date(latest)) / 86400000);
-        if (gap <= 0) onTrackCount++;
+        if (gap <= 0) onTrack.push(s.name);
         else behind.push(`${s.name}（填到${latest.slice(5)}，落後${gap}天）`);
       });
 
+      // 「大家的進度」要列出每一間店，不能只給準時的數字——落後/沒填的名單再清楚，
+      // 準時的店只給一個數字還是等於沒回報到「誰做得好」。
       const progressParts = [];
-      if (onTrackCount) progressParts.push(`✅ 跟上進度：${onTrackCount}/${stores.length} 間`);
+      if (onTrack.length) progressParts.push(`✅ 跟上進度（${onTrack.length}/${stores.length}）：${onTrack.join('、')}`);
       if (behind.length) progressParts.push(`⚠️ 落後：${behind.join('、')}`);
       if (never.length) progressParts.push(`🚫 近14天沒填：${never.join('、')}`);
       progressMsg = progressParts.join('\n');
