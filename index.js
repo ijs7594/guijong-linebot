@@ -215,6 +215,90 @@ async function listPendingTasks() {
   } catch { return []; }
 }
 
+// ── 四象限分析彙整（累積式，跟每日工事月結/季結同一套節奏）──────────
+
+async function fetchTasksInRange(sinceISO, untilISO) {
+  if (!SUPABASE_URL) return [];
+  try {
+    const res = await dbFetch(`tasks?created_at=gte.${sinceISO}&created_at=lt.${untilISO}&select=id,content,quadrant,action,created_at&order=created_at.asc`);
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+// 回傳 { text, counts, total, unclassified, delegateRate }——text 給 LINE 推播用，
+// 其餘結構化欄位存進 task_quadrant_snapshots，網頁的累積趨勢頁靠這些欄位畫圖，不用重新解析文字。
+function buildQuadrantAnalysis(tasks, title, prevDelegateRate) {
+  const counts = { 重要緊急: 0, 重要不緊急: 0, 緊急不重要: 0, 不重要不緊急: 0 };
+  let classifiedTotal = 0;
+  tasks.forEach(t => {
+    if (counts[t.quadrant] === undefined) return;
+    counts[t.quadrant]++;
+    classifiedTotal++;
+  });
+  const unclassified = tasks.length - classifiedTotal;
+
+  if (!classifiedTotal) {
+    return {
+      text: `${title}\n\n${tasks.length ? '這段期間的任務語音太破碎，AI 判斷不出結果' : '這段期間沒有任務紀錄，是漏記了，還是真的都授權出去了？'}`,
+      counts, total: 0, unclassified, delegateRate: null
+    };
+  }
+
+  const pct = n => Math.round((n / classifiedTotal) * 100);
+  const delegateCount = counts.緊急不重要 + counts.不重要不緊急;
+  const delegateRate = Math.round((delegateCount / classifiedTotal) * 100);
+
+  let msg = `${title}（共 ${classifiedTotal} 筆已分類${unclassified ? `，另有 ${unclassified} 筆語音太破碎沒判斷出來` : ''}）\n\n`;
+  msg += `🔴 重要緊急：${counts.重要緊急} 筆（${pct(counts.重要緊急)}%）親自處理\n`;
+  msg += `🔵 重要不緊急：${counts.重要不緊急} 筆（${pct(counts.重要不緊急)}%）排時間做\n`;
+  msg += `🟠 緊急不重要：${counts.緊急不重要} 筆（${pct(counts.緊急不重要)}%）授權出去\n`;
+  msg += `⚪ 不重要不緊急：${counts.不重要不緊急} 筆（${pct(counts.不重要不緊急)}%）刪除或忽略\n`;
+  msg += `\n📊 該授權或該放掉的比例：${delegateRate}%`;
+
+  if (typeof prevDelegateRate === 'number') {
+    const diff = delegateRate - prevDelegateRate;
+    const arrow = diff > 0 ? '↑' : diff < 0 ? '↓' : '→';
+    msg += `（上一期 ${prevDelegateRate}% ${arrow}）`;
+  }
+
+  return { text: msg.trim(), counts, total: classifiedTotal, unclassified, delegateRate };
+}
+
+async function saveQuadrantSnapshot({ periodLabel, periodStart, periodEnd, isQuarter = false, analysis }) {
+  if (!SUPABASE_URL) return false;
+  try {
+    const r = await dbFetch('task_quadrant_snapshots', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({
+        period_label: periodLabel,
+        period_start: periodStart,
+        period_end: periodEnd,
+        is_quarter: isQuarter,
+        total: analysis.total,
+        unclassified: analysis.unclassified,
+        count_do: analysis.counts.重要緊急,
+        count_schedule: analysis.counts.重要不緊急,
+        count_delegate: analysis.counts.緊急不重要,
+        count_drop: analysis.counts.不重要不緊急,
+        delegate_rate: analysis.delegateRate,
+        summary_text: analysis.text
+      })
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+async function fetchLatestQuadrantSnapshot(isQuarter = false) {
+  if (!SUPABASE_URL) return null;
+  try {
+    const res = await dbFetch(`task_quadrant_snapshots?is_quarter=eq.${isQuarter}&order=period_start.desc&limit=1`);
+    const data = await res.json();
+    return Array.isArray(data) && data[0] ? data[0] : null;
+  } catch { return null; }
+}
+
 // ── 每日摘要 ──────────────────────────────────────────
 
 async function getOperatingStores() {
@@ -1127,12 +1211,25 @@ cron.schedule('30 8 1 * *', async () => {
     const monthLabel = `${monthStart.getFullYear()}/${monthStart.getMonth() + 1} 月`;
     await pushToUser(HANBO_USER_ID, buildWorklogSummary(monthLogs, `📊 ${monthLabel}工事彙整`));
 
+    // 四象限分析：累積存進 task_quadrant_snapshots，跟上個月比才看得出授權比例有沒有變好
+    const prevSnapshot = await fetchLatestQuadrantSnapshot(false);
+    const monthTasks = await fetchTasksInRange(monthStart.toISOString(), monthEnd.toISOString());
+    const monthQuad = buildQuadrantAnalysis(monthTasks, `🧭 ${monthLabel} 四象限分析`, prevSnapshot ? prevSnapshot.delegate_rate : null);
+    await saveQuadrantSnapshot({ periodLabel: monthLabel, periodStart: monthStart.toISOString(), periodEnd: monthEnd.toISOString(), isQuarter: false, analysis: monthQuad });
+    await pushToUser(HANBO_USER_ID, monthQuad.text);
+
     if ([0, 3, 6, 9].includes(now.getMonth())) {
       const qStart = new Date(now.getFullYear(), now.getMonth() - 3, 1);
       const qLogs = (await fetchWorkLogs(qStart.toISOString()))
         .filter(l => new Date(l.created_at) < monthEnd);
       const qLabel = `${qStart.getFullYear()} Q${Math.floor(qStart.getMonth() / 3) + 1}`;
       await pushToUser(HANBO_USER_ID, buildWorklogSummary(qLogs, `📈 ${qLabel} 工事彙整`));
+
+      const prevQSnapshot = await fetchLatestQuadrantSnapshot(true);
+      const qTasks = await fetchTasksInRange(qStart.toISOString(), monthEnd.toISOString());
+      const qQuad = buildQuadrantAnalysis(qTasks, `🧭 ${qLabel} 四象限分析`, prevQSnapshot ? prevQSnapshot.delegate_rate : null);
+      await saveQuadrantSnapshot({ periodLabel: qLabel, periodStart: qStart.toISOString(), periodEnd: monthEnd.toISOString(), isQuarter: true, analysis: qQuad });
+      await pushToUser(HANBO_USER_ID, qQuad.text);
     }
   } catch (err) {
     console.error('工事彙整推播失敗:', err);
