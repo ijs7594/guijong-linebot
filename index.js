@@ -964,7 +964,10 @@ app.post('/api/generate-quadrant-snapshot', async (req, res) => {
       const earliest = await earliestRes.json();
       sinceISO = earliest[0]?.created_at || new Date().toISOString();
     }
-    if (!untilISO) untilISO = new Date().toISOString();
+    // 帶 +00:00 時區的 timestamp 字面上的 "+" 沒編碼直接塞進 query string 會被當空白解析、
+    // 篩不到任何資料，不管是自動抓的還是呼叫端傳進來的，一律轉成 Date 再吐一次 ISO（保證 Z 結尾）
+    sinceISO = new Date(sinceISO).toISOString();
+    untilISO = untilISO ? new Date(untilISO).toISOString() : new Date().toISOString();
     if (!periodLabel) periodLabel = `累積至${new Date(untilISO).getFullYear()}/${new Date(untilISO).getMonth() + 1}（即時）`;
 
     const tasks = await fetchTasksInRange(sinceISO, untilISO);
