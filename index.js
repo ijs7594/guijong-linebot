@@ -151,16 +151,58 @@ async function transcribeAudio(audioBuffer) {
 
 // ── 任務系統 ──────────────────────────────────────────
 
+// 待辦一進 Inbox 就用「重要／緊急」四象限判斷，目的是幫執行長把重要的事留在自己手上、
+// 該授權的授權出去，不用每件事都靠他自己一件件想過一遍。
+async function classifyTaskPriority(content) {
+  try {
+    const res = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      system: `你是漢柏分身，執行長剛把一件事丟進待辦 Inbox。用「重要／緊急」四象限幫他判斷這件事該怎麼處理，目的是把重要的事留在他手上、該授權的授權出去，避免他被瑣事淹沒。只回傳 JSON，不要其他文字：
+{"quadrant":"重要緊急|重要不緊急|緊急不重要|不重要不緊急","action":"親自處理|排時間做|授權出去|刪除或忽略","reason":"一句不超過30字的理由，語氣像教練，直接但溫暖"}
+
+判斷原則：
+- 重要：跟公司方向、人才發展、關鍵決策、店務核心風險有關，別人做不了或做錯代價高
+- 不重要：瑣事、例行事務、對公司影響小，員工或系統就能處理
+- 緊急：有明確時間壓力，拖延會造成損失或錯過時機
+- 不緊急：沒有立即時間壓力，可以排時間或交給別人
+
+四象限對應動作：
+- 重要緊急 → 親自處理：現在就做，別人做不了
+- 重要不緊急 → 排時間做：排進行程表親自處理，但不用現在
+- 緊急不重要 → 授權出去：找人代辦，執行長不必親自做
+- 不重要不緊急 → 刪除或忽略：可以直接不做，或之後有空再說
+
+若內容太模糊完全無法判斷 → {"error":"無法辨識"}`,
+      messages: [{ role: 'user', content }]
+    });
+    const raw = res.content[0].text.trim().replace(/^```(?:json)?|```$/g, '').trim();
+    return JSON.parse(raw);
+  } catch { return { error: '解析失敗' }; }
+}
+
 async function saveTask(content, source = 'line_voice') {
-  if (!SUPABASE_URL) return false;
+  if (!SUPABASE_URL) return { ok: false, classified: null };
+  const classified = await classifyTaskPriority(content);
+  const body = { content, source, status: 'pending' };
+  if (!classified.error) {
+    body.quadrant = classified.quadrant || null;
+    body.action = classified.action || null;
+    body.ai_note = classified.reason || null;
+  }
   try {
     const r = await dbFetch('tasks', {
       method: 'POST',
       headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ content, source, status: 'pending' })
+      body: JSON.stringify(body)
     });
-    return r.ok;
-  } catch { return false; }
+    return { ok: r.ok, classified: classified.error ? null : classified };
+  } catch { return { ok: false, classified: null }; }
+}
+
+function quadrantTag(classified) {
+  if (!classified || !classified.quadrant) return '';
+  return `\n\n📌 ${classified.quadrant}｜建議：${classified.action}\n${classified.reason || ''}`;
 }
 
 async function listPendingTasks() {
@@ -701,6 +743,32 @@ app.post('/api/task-completed', async (req, res) => {
   }
 });
 
+// inbox.html 網頁快速新增的任務不會經過 saveTask，補這支 API 讓它也能拿到同一套
+// 重要／緊急四象限判斷，寫回 tasks 資料表，網頁下次刷新就會看到分類結果。
+app.post('/api/classify-task', async (req, res) => {
+  if (!NOTIFY_SECRET || req.body.secret !== NOTIFY_SECRET) return res.status(403).send('forbidden');
+  const id = req.body.id;
+  const content = (req.body.content || '').trim();
+  if (!id || !content) return res.status(400).send('缺少 id 或 content');
+  res.send('ok');
+
+  try {
+    const classified = await classifyTaskPriority(content);
+    if (classified.error) return;
+    await dbFetch(`tasks?id=eq.${id}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({
+        quadrant: classified.quadrant || null,
+        action: classified.action || null,
+        ai_note: classified.reason || null
+      })
+    });
+  } catch (err) {
+    console.error('任務分類失敗:', err);
+  }
+});
+
 app.post('/webhook', async (req, res) => {
   const signature = req.headers['x-line-signature'];
   if (!verifySignature(req.rawBody, signature)) return res.status(403).send('Invalid signature');
@@ -724,8 +792,8 @@ app.post('/webhook', async (req, res) => {
         });
         const audioBuffer = await audioRes.arrayBuffer();
         const text = await transcribeAudio(audioBuffer);
-        await saveTask(text, 'line_voice');
-        await replyToLine(replyToken, `✅ 任務記錄\n\n「${text}」\n\n網頁已同步 → ijs7594.github.io/inbox.html\n\n傳「選單」繼續`);
+        const { classified } = await saveTask(text, 'line_voice');
+        await replyToLine(replyToken, `✅ 任務記錄\n\n「${text}」${quadrantTag(classified)}\n\n網頁已同步 → ijs7594.github.io/inbox.html\n\n傳「選單」繼續`);
       } catch (err) {
         console.error('語音辨識失敗:', err);
         await replyToLine(replyToken, '語音辨識失敗，請改用文字：\n「任務 你的任務內容」');
@@ -751,8 +819,8 @@ app.post('/webhook', async (req, res) => {
     if (userText.startsWith('任務 ') || userText.startsWith('todo ')) {
       const content = userText.replace(/^(任務|todo)\s+/i, '').trim();
       if (content) {
-        await saveTask(content, 'line_text');
-        await replyToLine(replyToken, `✅ 任務記錄\n\n「${content}」\n\n繼續傳下一個，或傳「選單」`);
+        const { classified } = await saveTask(content, 'line_text');
+        await replyToLine(replyToken, `✅ 任務記錄\n\n「${content}」${quadrantTag(classified)}\n\n繼續傳下一個，或傳「選單」`);
       } else {
         await replyToLine(replyToken, '請在「任務」後面加上內容，例如：\n「任務 追蹤小明的排班問題」');
       }
