@@ -158,12 +158,12 @@ async function classifyTaskPriority(content) {
     const res = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 300,
-      system: `你是漢柏分身，執行長剛把一件事丟進待辦 Inbox。用「重要／緊急」四象限幫他判斷這件事該怎麼處理，目的是把重要的事留在他手上、該授權的授權出去，避免他被瑣事淹沒。只回傳 JSON，不要其他文字：
+      system: `你是漢柏分身，執行長剛把一件事丟進待辦 Inbox。這個 Inbox 同時裝公司事務跟個人生活事務（家人、健康、人際關係、雜事都會出現），用「重要／緊急」四象限幫他判斷這件事該怎麼處理，目的是幫他把人生跟公司裡真正重要的事留在自己手上、該授權或該放掉的就授權放掉，避免他被瑣事淹沒。只回傳 JSON，不要其他文字：
 {"quadrant":"重要緊急|重要不緊急|緊急不重要|不重要不緊急","action":"親自處理|排時間做|授權出去|刪除或忽略","reason":"一句不超過30字的理由，語氣像教練，直接但溫暖"}
 
-判斷原則：
-- 重要：跟公司方向、人才發展、關鍵決策、店務核心風險有關，別人做不了或做錯代價高
-- 不重要：瑣事、例行事務、對公司影響小，員工或系統就能處理
+判斷原則（公司事務跟個人生活事務都適用同一套邏輯，不要因為不是公司的事就拒絕判斷）：
+- 重要：跟公司方向、人才發展、關鍵決策、店務核心風險有關；或跟家人健康、重要關係、個人核心承諾有關——別人做不了、或做錯/不做代價高
+- 不重要：瑣事、例行事務、跑腿雜務，員工、系統或家人朋友就能處理，對大局影響小
 - 緊急：有明確時間壓力，拖延會造成損失或錯過時機
 - 不緊急：沒有立即時間壓力，可以排時間或交給別人
 
@@ -173,12 +173,13 @@ async function classifyTaskPriority(content) {
 - 緊急不重要 → 授權出去：找人代辦，執行長不必親自做
 - 不重要不緊急 → 刪除或忽略：可以直接不做，或之後有空再說
 
-若內容太模糊完全無法判斷 → {"error":"無法辨識"}`,
+只有在內容破碎到完全看不懂在講什麼事（例如語音辨識錯誤導致文字不成句）時才回傳 {"error":"無法辨識"}；只要看得懂是在做什麼事，即使很瑣碎、即使是私事，都要給出四象限判斷，不要用「不是公司的事」當理由拒絕分類。`,
       messages: [{ role: 'user', content }]
     });
-    const raw = res.content[0].text.trim().replace(/^```(?:json)?|```$/g, '').trim();
-    return JSON.parse(raw);
-  } catch { return { error: '解析失敗' }; }
+    const text = res.content[0].text.trim();
+    const match = text.match(/\{[\s\S]*\}/);
+    return JSON.parse(match ? match[0] : text);
+  } catch (err) { console.error('classifyTaskPriority failed:', err); return { error: '解析失敗' }; }
 }
 
 async function saveTask(content, source = 'line_voice') {
@@ -756,8 +757,8 @@ app.post('/api/classify-task', async (req, res) => {
 
   try {
     const classified = await classifyTaskPriority(content);
-    if (classified.error) return;
-    await dbFetch(`tasks?id=eq.${id}`, {
+    if (classified.error) { console.error(`任務分類無結果 id=${id}:`, classified.error, '|', content); return; }
+    const patchRes = await dbFetch(`tasks?id=eq.${id}`, {
       method: 'PATCH',
       headers: { Prefer: 'return=minimal' },
       body: JSON.stringify({
@@ -766,6 +767,7 @@ app.post('/api/classify-task', async (req, res) => {
         ai_note: classified.reason || null
       })
     });
+    if (!patchRes.ok) console.error(`任務分類寫入失敗 id=${id}:`, patchRes.status, await patchRes.text());
   } catch (err) {
     console.error('任務分類失敗:', err);
   }
