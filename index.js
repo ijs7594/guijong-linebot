@@ -226,15 +226,52 @@ async function fetchTasksInRange(sinceISO, untilISO) {
   } catch { return []; }
 }
 
+// 讀懂內容之間的關聯，給真正的教練式分析——不是複述分類數字。
+// 用 claude-opus-5：這是每月/每季才跑一次的低頻呼叫，值得用最會判斷的模型换真正有用的建議。
+async function generateQuadrantAdvice(classifiedTasks, statsBlock) {
+  if (!ANTHROPIC_API_KEY) return '（未設定 AI 金鑰，無法產生分析建議）';
+  try {
+    const listStr = classifiedTasks
+      .map((t, i) => `${i + 1}. [${t.quadrant}] ${t.content}`)
+      .join('\n');
+    const res = await anthropic.messages.create({
+      model: 'claude-opus-5',
+      max_tokens: 2000,
+      system: `你是漢柏分身。漢柏是「貴焿古早味麵線羹」執行長，教練型領導者，基督徒，核心價值是「幫人發展與提升人生方向比賺大錢更重要」，信念句是「使人和睦的人有福了」（馬太福音5:9）。
+
+他剛看完這段期間待辦 Inbox 裡每件事的重要／緊急分類統計，但覺得那只是冷冰冰的分類，沒有真正幫他判斷「該做什麼」。你的任務是給出真正的教練式分析建議，不是重複統計數字。
+
+寫作要求：
+- 直接指出這段期間事項裡「值得注意的模式」，不是逐條複述
+- 特別抓出「重要不緊急」裡有沒有其實是「還沒教得會、還在靠他重複做」的事，如果有，明講並建議走SOP流程整理起來
+- 特別抓出「緊急不重要」「不重要不緊急」裡重複出現的類型，並指出「這類事現在有沒有一個固定會接手的人」——如果沒有，這才是真正該做的決定，不是知道要授權而已，是要具體「揀選」一個人
+- 如果有明顯的私人生活雜務混進來，點出這代表的時間架構問題（公司/生活入口沒有分開），不用每次都講
+- 語氣可以自然引用聖經智慧或商業領導觀念（例如出埃及記18章葉忒羅勸摩西分工的故事、耶穌訓練門徒傳承使命的模式），但只在真正貼切時用，不要每次都硬塞、不要說教感
+- 結尾給一個具體、這週就能做的下一步行動，不是空泛鼓勵
+- 繁體中文，300字上下，不要條列所有事項，抓重點就好，語氣溫暖但有深度，不說廢話，不要開頭客套話
+
+回傳純文字，不要用 JSON。`,
+      messages: [{ role: 'user', content: `統計摘要：\n${statsBlock}\n\n這段期間的分類清單：\n${listStr}` }]
+    });
+    const block = res.content.find(b => b.type === 'text');
+    return (block && block.text.trim()) || '（這期沒有產生分析建議）';
+  } catch (err) {
+    console.error('generateQuadrantAdvice failed:', err);
+    return '（分析建議產生失敗，稍後再看）';
+  }
+}
+
 // 回傳 { text, counts, total, unclassified, delegateRate }——text 給 LINE 推播用，
 // 其餘結構化欄位存進 task_quadrant_snapshots，網頁的累積趨勢頁靠這些欄位畫圖，不用重新解析文字。
-function buildQuadrantAnalysis(tasks, title, prevDelegateRate) {
+async function buildQuadrantAnalysis(tasks, title, prevDelegateRate) {
   const counts = { 重要緊急: 0, 重要不緊急: 0, 緊急不重要: 0, 不重要不緊急: 0 };
   let classifiedTotal = 0;
+  const classifiedTasks = [];
   tasks.forEach(t => {
     if (counts[t.quadrant] === undefined) return;
     counts[t.quadrant]++;
     classifiedTotal++;
+    classifiedTasks.push(t);
   });
   const unclassified = tasks.length - classifiedTotal;
 
@@ -249,20 +286,23 @@ function buildQuadrantAnalysis(tasks, title, prevDelegateRate) {
   const delegateCount = counts.緊急不重要 + counts.不重要不緊急;
   const delegateRate = Math.round((delegateCount / classifiedTotal) * 100);
 
-  let msg = `${title}（共 ${classifiedTotal} 筆已分類${unclassified ? `，另有 ${unclassified} 筆語音太破碎沒判斷出來` : ''}）\n\n`;
-  msg += `🔴 重要緊急：${counts.重要緊急} 筆（${pct(counts.重要緊急)}%）親自處理\n`;
-  msg += `🔵 重要不緊急：${counts.重要不緊急} 筆（${pct(counts.重要不緊急)}%）排時間做\n`;
-  msg += `🟠 緊急不重要：${counts.緊急不重要} 筆（${pct(counts.緊急不重要)}%）授權出去\n`;
-  msg += `⚪ 不重要不緊急：${counts.不重要不緊急} 筆（${pct(counts.不重要不緊急)}%）刪除或忽略\n`;
-  msg += `\n📊 該授權或該放掉的比例：${delegateRate}%`;
+  let statsBlock = `${title}（共 ${classifiedTotal} 筆已分類${unclassified ? `，另有 ${unclassified} 筆語音太破碎沒判斷出來` : ''}）\n\n`;
+  statsBlock += `🔴 重要緊急：${counts.重要緊急} 筆（${pct(counts.重要緊急)}%）親自處理\n`;
+  statsBlock += `🔵 重要不緊急：${counts.重要不緊急} 筆（${pct(counts.重要不緊急)}%）排時間做\n`;
+  statsBlock += `🟠 緊急不重要：${counts.緊急不重要} 筆（${pct(counts.緊急不重要)}%）授權出去\n`;
+  statsBlock += `⚪ 不重要不緊急：${counts.不重要不緊急} 筆（${pct(counts.不重要不緊急)}%）刪除或忽略\n`;
+  statsBlock += `\n📊 該授權或該放掉的比例：${delegateRate}%`;
 
   if (typeof prevDelegateRate === 'number') {
     const diff = delegateRate - prevDelegateRate;
     const arrow = diff > 0 ? '↑' : diff < 0 ? '↓' : '→';
-    msg += `（上一期 ${prevDelegateRate}% ${arrow}）`;
+    statsBlock += `（上一期 ${prevDelegateRate}% ${arrow}）`;
   }
 
-  return { text: msg.trim(), counts, total: classifiedTotal, unclassified, delegateRate };
+  const advice = await generateQuadrantAdvice(classifiedTasks, statsBlock);
+  const text = `${statsBlock.trim()}\n\n💡 ${advice}`;
+
+  return { text, counts, total: classifiedTotal, unclassified, delegateRate };
 }
 
 async function saveQuadrantSnapshot({ periodLabel, periodStart, periodEnd, isQuarter = false, analysis }) {
@@ -913,6 +953,31 @@ app.post('/api/classify-task', async (req, res) => {
   }
 });
 
+// 手動觸發一次四象限分析快照（不用等每月1號的 cron）。傳 sinceISO/untilISO/periodLabel
+// 自訂區間，不傳就預設「從第一筆任務到現在」，方便隨時想看最新分析建議時補一筆。
+app.post('/api/generate-quadrant-snapshot', async (req, res) => {
+  if (!NOTIFY_SECRET || req.body.secret !== NOTIFY_SECRET) return res.status(403).send('forbidden');
+  try {
+    let { sinceISO, untilISO, periodLabel, isQuarter } = req.body;
+    if (!sinceISO) {
+      const earliestRes = await dbFetch('tasks?select=created_at&order=created_at.asc&limit=1');
+      const earliest = await earliestRes.json();
+      sinceISO = earliest[0]?.created_at || new Date().toISOString();
+    }
+    if (!untilISO) untilISO = new Date().toISOString();
+    if (!periodLabel) periodLabel = `累積至${new Date(untilISO).getFullYear()}/${new Date(untilISO).getMonth() + 1}（即時）`;
+
+    const tasks = await fetchTasksInRange(sinceISO, untilISO);
+    const prevSnapshot = await fetchLatestQuadrantSnapshot(Boolean(isQuarter));
+    const analysis = await buildQuadrantAnalysis(tasks, `🧭 ${periodLabel} 四象限分析`, prevSnapshot ? prevSnapshot.delegate_rate : null);
+    const ok = await saveQuadrantSnapshot({ periodLabel, periodStart: sinceISO, periodEnd: untilISO, isQuarter: Boolean(isQuarter), analysis });
+    res.json({ ok, analysis });
+  } catch (err) {
+    console.error('手動觸發四象限分析失敗:', err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 app.post('/webhook', async (req, res) => {
   const signature = req.headers['x-line-signature'];
   if (!verifySignature(req.rawBody, signature)) return res.status(403).send('Invalid signature');
@@ -1287,7 +1352,7 @@ cron.schedule('30 8 1 * *', async () => {
 
     const prevSnapshot = await fetchLatestQuadrantSnapshot(false);
     const monthTasks = await fetchTasksInRange(monthStart.toISOString(), monthEnd.toISOString());
-    const monthQuad = buildQuadrantAnalysis(monthTasks, `🧭 ${monthLabel} 四象限分析`, prevSnapshot ? prevSnapshot.delegate_rate : null);
+    const monthQuad = await buildQuadrantAnalysis(monthTasks, `🧭 ${monthLabel} 四象限分析`, prevSnapshot ? prevSnapshot.delegate_rate : null);
     await saveQuadrantSnapshot({ periodLabel: monthLabel, periodStart: monthStart.toISOString(), periodEnd: monthEnd.toISOString(), isQuarter: false, analysis: monthQuad });
     await pushToUser(HANBO_USER_ID, monthQuad.text);
 
@@ -1296,7 +1361,7 @@ cron.schedule('30 8 1 * *', async () => {
       const qLabel = `${qStart.getFullYear()} Q${Math.floor(qStart.getMonth() / 3) + 1}`;
       const prevQSnapshot = await fetchLatestQuadrantSnapshot(true);
       const qTasks = await fetchTasksInRange(qStart.toISOString(), monthEnd.toISOString());
-      const qQuad = buildQuadrantAnalysis(qTasks, `🧭 ${qLabel} 四象限分析`, prevQSnapshot ? prevQSnapshot.delegate_rate : null);
+      const qQuad = await buildQuadrantAnalysis(qTasks, `🧭 ${qLabel} 四象限分析`, prevQSnapshot ? prevQSnapshot.delegate_rate : null);
       await saveQuadrantSnapshot({ periodLabel: qLabel, periodStart: qStart.toISOString(), periodEnd: monthEnd.toISOString(), isQuarter: true, analysis: qQuad });
       await pushToUser(HANBO_USER_ID, qQuad.text);
     }
