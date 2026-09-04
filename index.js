@@ -1267,7 +1267,24 @@ cron.schedule('30 8 1 * *', async () => {
     const monthLabel = `${monthStart.getFullYear()}/${monthStart.getMonth() + 1} 月`;
     await pushToUser(HANBO_USER_ID, buildWorklogSummary(monthLogs, `📊 ${monthLabel}工事彙整`));
 
-    // 四象限分析：累積存進 task_quadrant_snapshots，跟上個月比才看得出授權比例有沒有變好
+    if ([0, 3, 6, 9].includes(now.getMonth())) {
+      const qStart = new Date(now.getFullYear(), now.getMonth() - 3, 1);
+      const qLogs = (await fetchWorkLogs(qStart.toISOString())).filter(l => new Date(l.created_at) < monthEnd);
+      const qLabel = `${qStart.getFullYear()} Q${Math.floor(qStart.getMonth() / 3) + 1}`;
+      await pushToUser(HANBO_USER_ID, buildWorklogSummary(qLogs, `📈 ${qLabel} 工事彙整`));
+    }
+  } catch (err) {
+    console.error('工事彙整推播失敗:', err);
+  }
+
+  // 四象限分析獨立一個 try/catch——這段是這次新加的，萬一它出錯，
+  // 不該連上面既有、已經穩定在跑的每日工事月結/季結彙整都被拖著一起中斷。
+  try {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const monthEnd = new Date(now.getFullYear(), now.getMonth(), 1);
+    const monthLabel = `${monthStart.getFullYear()}/${monthStart.getMonth() + 1} 月`;
+
     const prevSnapshot = await fetchLatestQuadrantSnapshot(false);
     const monthTasks = await fetchTasksInRange(monthStart.toISOString(), monthEnd.toISOString());
     const monthQuad = buildQuadrantAnalysis(monthTasks, `🧭 ${monthLabel} 四象限分析`, prevSnapshot ? prevSnapshot.delegate_rate : null);
@@ -1276,11 +1293,7 @@ cron.schedule('30 8 1 * *', async () => {
 
     if ([0, 3, 6, 9].includes(now.getMonth())) {
       const qStart = new Date(now.getFullYear(), now.getMonth() - 3, 1);
-      const qLogs = (await fetchWorkLogs(qStart.toISOString()))
-        .filter(l => new Date(l.created_at) < monthEnd);
       const qLabel = `${qStart.getFullYear()} Q${Math.floor(qStart.getMonth() / 3) + 1}`;
-      await pushToUser(HANBO_USER_ID, buildWorklogSummary(qLogs, `📈 ${qLabel} 工事彙整`));
-
       const prevQSnapshot = await fetchLatestQuadrantSnapshot(true);
       const qTasks = await fetchTasksInRange(qStart.toISOString(), monthEnd.toISOString());
       const qQuad = buildQuadrantAnalysis(qTasks, `🧭 ${qLabel} 四象限分析`, prevQSnapshot ? prevQSnapshot.delegate_rate : null);
@@ -1288,7 +1301,7 @@ cron.schedule('30 8 1 * *', async () => {
       await pushToUser(HANBO_USER_ID, qQuad.text);
     }
   } catch (err) {
-    console.error('工事彙整推播失敗:', err);
+    console.error('四象限分析彙整失敗:', err);
   }
 }, { timezone: 'Asia/Taipei' });
 
