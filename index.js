@@ -220,7 +220,7 @@ async function listPendingTasks() {
 async function fetchTasksInRange(sinceISO, untilISO) {
   if (!SUPABASE_URL) return [];
   try {
-    const res = await dbFetch(`tasks?created_at=gte.${sinceISO}&created_at=lt.${untilISO}&select=id,content,quadrant,action,created_at&order=created_at.asc`);
+    const res = await dbFetch(`tasks?created_at=gte.${sinceISO}&created_at=lt.${untilISO}&select=id,content,quadrant,action,status,completed_by,created_at&order=created_at.asc`);
     const data = await res.json();
     return Array.isArray(data) ? data : [];
   } catch { return []; }
@@ -782,7 +782,7 @@ async function pushToUser(userId, message) {
 
 // ── Webhook ──────────────────────────────────────────
 
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(express.json({ limit: '10mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.get('/', (req, res) => res.send('貴焿 LINE Bot 運行中 🍜'));
 
 app.use('/api', (req, res, next) => {
