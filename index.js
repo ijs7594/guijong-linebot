@@ -246,6 +246,7 @@ async function generateQuadrantAdvice(classifiedTasks, statsBlock) {
 - 特別抓出「重要不緊急」裡有沒有其實是「還沒教得會、還在靠他重複做」的事，如果有，明講並建議走SOP流程整理起來
 - 特別抓出「緊急不重要」「不重要不緊急」裡重複出現的類型，並指出「這類事現在有沒有一個固定會接手的人」——如果沒有，這才是真正該做的決定，不是知道要授權而已，是要具體「揀選」一個人
 - 如果有明顯的私人生活雜務混進來，點出這代表的時間架構問題（公司/生活入口沒有分開），不用每次都講
+- 統計摘要裡如果有「真的交給別人的比例」，這是全篇最重要的評分依據：比上一期進步或維持高比例，要給真誠具體的好評，講清楚是哪類事真的做到了授權；比上一期退步、或完全沒人標記，要誠實講，不要假裝鼓勵、不要無中生有地稱讚——他明確說過「如果我把該分配出去的事分配出去、做重要的事，你就要給我好評」，好評要建立在這個真實數字上，不是分類本身
 - 語氣可以自然引用聖經智慧或商業領導觀念（例如出埃及記18章葉忒羅勸摩西分工的故事、耶穌訓練門徒傳承使命的模式），但只在真正貼切時用，不要每次都硬塞、不要說教感
 - 結尾給一個具體、這週就能做的下一步行動，不是空泛鼓勵
 - 繁體中文，300字上下，不要條列所有事項，抓重點就好，語氣溫暖但有深度，不說廢話，不要開頭客套話
@@ -261,9 +262,11 @@ async function generateQuadrantAdvice(classifiedTasks, statsBlock) {
   }
 }
 
-// 回傳 { text, counts, total, unclassified, delegateRate }——text 給 LINE 推播用，
+const DELEGATE_QUADRANTS = ['緊急不重要', '不重要不緊急'];
+
+// 回傳 { text, counts, total, unclassified, delegateRate, followThroughRate }——text 給 LINE 推播用，
 // 其餘結構化欄位存進 task_quadrant_snapshots，網頁的累積趨勢頁靠這些欄位畫圖，不用重新解析文字。
-async function buildQuadrantAnalysis(tasks, title, prevDelegateRate) {
+async function buildQuadrantAnalysis(tasks, title, prevDelegateRate, prevFollowThroughRate) {
   const counts = { 重要緊急: 0, 重要不緊急: 0, 緊急不重要: 0, 不重要不緊急: 0 };
   let classifiedTotal = 0;
   const classifiedTasks = [];
@@ -278,13 +281,23 @@ async function buildQuadrantAnalysis(tasks, title, prevDelegateRate) {
   if (!classifiedTotal) {
     return {
       text: `${title}\n\n${tasks.length ? '這段期間的任務語音太破碎，AI 判斷不出結果' : '這段期間沒有任務紀錄，是漏記了，還是真的都授權出去了？'}`,
-      counts, total: 0, unclassified, delegateRate: null
+      counts, total: 0, unclassified, delegateRate: null, followThroughRate: null
     };
   }
 
   const pct = n => Math.round((n / classifiedTotal) * 100);
   const delegateCount = counts.緊急不重要 + counts.不重要不緊急;
   const delegateRate = Math.round((delegateCount / classifiedTotal) * 100);
+
+  // 分類只講「這件事該授權出去」，不代表他真的授權了——用 completed_by 標記
+  // 才知道是自己偷偷做掉還是真的交給別人，好評要建立在這個真實數字上。
+  const delegateDone = classifiedTasks.filter(t => DELEGATE_QUADRANTS.includes(t.quadrant) && t.status === 'done');
+  const delegateDoneTagged = delegateDone.filter(t => t.completed_by);
+  const delegateDoneUntagged = delegateDone.length - delegateDoneTagged.length;
+  const delegatedCount = delegateDoneTagged.filter(t => t.completed_by === '別人').length;
+  const followThroughRate = delegateDoneTagged.length
+    ? Math.round((delegatedCount / delegateDoneTagged.length) * 100)
+    : null;
 
   let statsBlock = `${title}（共 ${classifiedTotal} 筆已分類${unclassified ? `，另有 ${unclassified} 筆語音太破碎沒判斷出來` : ''}）\n\n`;
   statsBlock += `🔴 重要緊急：${counts.重要緊急} 筆（${pct(counts.重要緊急)}%）親自處理\n`;
@@ -299,10 +312,21 @@ async function buildQuadrantAnalysis(tasks, title, prevDelegateRate) {
     statsBlock += `（上一期 ${prevDelegateRate}% ${arrow}）`;
   }
 
+  if (followThroughRate !== null) {
+    statsBlock += `\n✅ 該授權出去的事，真的交給別人的比例：${followThroughRate}%（已標記 ${delegateDoneTagged.length} 件${delegateDoneUntagged ? `，另有 ${delegateDoneUntagged} 件還沒標記` : ''}）`;
+    if (typeof prevFollowThroughRate === 'number') {
+      const diff2 = followThroughRate - prevFollowThroughRate;
+      const arrow2 = diff2 > 0 ? '↑' : diff2 < 0 ? '↓' : '→';
+      statsBlock += `（上一期 ${prevFollowThroughRate}% ${arrow2}）`;
+    }
+  } else if (delegateDone.length) {
+    statsBlock += `\n✅ 該授權出去的事有 ${delegateDone.length} 件已完成，但都還沒標記是自己做的還是交給別人——去網頁標記一下，下次才看得出真的有沒有授權出去`;
+  }
+
   const advice = await generateQuadrantAdvice(classifiedTasks, statsBlock);
   const text = `${statsBlock.trim()}\n\n💡 ${advice}`;
 
-  return { text, counts, total: classifiedTotal, unclassified, delegateRate };
+  return { text, counts, total: classifiedTotal, unclassified, delegateRate, followThroughRate };
 }
 
 async function saveQuadrantSnapshot({ periodLabel, periodStart, periodEnd, isQuarter = false, analysis }) {
@@ -323,6 +347,7 @@ async function saveQuadrantSnapshot({ periodLabel, periodStart, periodEnd, isQua
         count_delegate: analysis.counts.緊急不重要,
         count_drop: analysis.counts.不重要不緊急,
         delegate_rate: analysis.delegateRate,
+        follow_through_rate: analysis.followThroughRate,
         summary_text: analysis.text
       })
     });
@@ -972,7 +997,7 @@ app.post('/api/generate-quadrant-snapshot', async (req, res) => {
 
     const tasks = await fetchTasksInRange(sinceISO, untilISO);
     const prevSnapshot = await fetchLatestQuadrantSnapshot(Boolean(isQuarter));
-    const analysis = await buildQuadrantAnalysis(tasks, `🧭 ${periodLabel} 四象限分析`, prevSnapshot ? prevSnapshot.delegate_rate : null);
+    const analysis = await buildQuadrantAnalysis(tasks, `🧭 ${periodLabel} 四象限分析`, prevSnapshot ? prevSnapshot.delegate_rate : null, prevSnapshot ? prevSnapshot.follow_through_rate : null);
     const ok = await saveQuadrantSnapshot({ periodLabel, periodStart: sinceISO, periodEnd: untilISO, isQuarter: Boolean(isQuarter), analysis });
     res.json({ ok, analysis });
   } catch (err) {
@@ -1355,7 +1380,7 @@ cron.schedule('30 8 1 * *', async () => {
 
     const prevSnapshot = await fetchLatestQuadrantSnapshot(false);
     const monthTasks = await fetchTasksInRange(monthStart.toISOString(), monthEnd.toISOString());
-    const monthQuad = await buildQuadrantAnalysis(monthTasks, `🧭 ${monthLabel} 四象限分析`, prevSnapshot ? prevSnapshot.delegate_rate : null);
+    const monthQuad = await buildQuadrantAnalysis(monthTasks, `🧭 ${monthLabel} 四象限分析`, prevSnapshot ? prevSnapshot.delegate_rate : null, prevSnapshot ? prevSnapshot.follow_through_rate : null);
     await saveQuadrantSnapshot({ periodLabel: monthLabel, periodStart: monthStart.toISOString(), periodEnd: monthEnd.toISOString(), isQuarter: false, analysis: monthQuad });
     await pushToUser(HANBO_USER_ID, monthQuad.text);
 
@@ -1364,7 +1389,7 @@ cron.schedule('30 8 1 * *', async () => {
       const qLabel = `${qStart.getFullYear()} Q${Math.floor(qStart.getMonth() / 3) + 1}`;
       const prevQSnapshot = await fetchLatestQuadrantSnapshot(true);
       const qTasks = await fetchTasksInRange(qStart.toISOString(), monthEnd.toISOString());
-      const qQuad = await buildQuadrantAnalysis(qTasks, `🧭 ${qLabel} 四象限分析`, prevQSnapshot ? prevQSnapshot.delegate_rate : null);
+      const qQuad = await buildQuadrantAnalysis(qTasks, `🧭 ${qLabel} 四象限分析`, prevQSnapshot ? prevQSnapshot.delegate_rate : null, prevQSnapshot ? prevQSnapshot.follow_through_rate : null);
       await saveQuadrantSnapshot({ periodLabel: qLabel, periodStart: qStart.toISOString(), periodEnd: monthEnd.toISOString(), isQuarter: true, analysis: qQuad });
       await pushToUser(HANBO_USER_ID, qQuad.text);
     }
