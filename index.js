@@ -845,17 +845,37 @@ exp 判斷：小發現/小提醒=15，一般心得/收穫=30，重大突破/重�
 app.post('/api/parse-daily-report-photo', async (req, res) => {
   const { image_base64, media_type, year, month } = req.body;
   if (!image_base64 || !year || !month) return res.status(400).json({ error: '缺少必要參數' });
-  const prompt = `這是一張手寫日報表照片，${year}年${month}月。
-欄位由左到右：日（幾號）、客數、現金、Line Pay、貸放支出（跳過）、理費支出（跳過）、總營收（跳過）、鍋數、熊貓(foodpanda)、UBER、現金實存、零錢
+  const prompt = `這是一張麵線店手寫日報表照片，${year}年${month}月。請仔細辨識每一格數字。
 
-只回傳 JSON，格式如下，不要其他文字：
-{"rows":[{"day":1,"customers":38,"cash":23077,"line_pay":1980,"uber":1551,"foodpanda":1831,"cash_counted":2300,"change":77,"pots":13}]}
+欄位由左到右固定順序：
+1. 日（號數 1~31）
+2. 客數（通常 60~200 人）
+3. 現金（通常 5,000~30,000 元）
+4. Line Pay（可能空白）
+5. 貸放支出（跳過，不需填）
+6. 理費支出（跳過，不需填）
+7. 總營收（跳過，不需填）
+8. 鍋數（通常 5~15，可有小數如 8.5）
+9. 熊貓 foodpanda（通常 500~5,000 元）
+10. UBER（通常 500~8,000 元）
+11. 現金實存（可能空白）
+12. 零錢（可能空白）
 
-注意：day 是號數(1~31)，看不清填 null，只解析有資料的行。`;
+辨識注意事項：
+- 數字 1 和 7 容易混淆，看筆畫仔細判斷
+- 數字 3 和 8 容易混淆
+- 數字 0 和 6 容易混淆
+- 若某格超出合理範圍，請重新確認是否讀錯位數
+- 千分位逗號忽略（13,234 就是 13234）
+
+只回傳 JSON，不要其他文字，格式：
+{"rows":[{"day":1,"customers":114,"cash":11255,"line_pay":null,"pots":8.25,"foodpanda":1905,"uber":4642,"cash_counted":null,"change":null}]}
+
+只解析有資料的行，看不清楚的欄位填 null。`;
   try {
     const msg = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 2000,
+      model: 'claude-sonnet-5',
+      max_tokens: 8000,
       messages: [{
         role: 'user',
         content: [
