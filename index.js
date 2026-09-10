@@ -853,23 +853,27 @@ app.post('/api/parse-daily-report-photo', async (req, res) => {
 
 注意：day 是號數(1~31)，看不清填 null，只解析有資料的行。`;
   try {
-    const resp = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${XAI_API_KEY}` },
-      body: JSON.stringify({
-        model: 'grok-4.5',
-        max_tokens: 2000,
-        messages: [{ role: 'user', content: [
-          { type: 'image_url', image_url: { url: `data:${media_type || 'image/jpeg'};base64,${image_base64}` } },
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: 2000,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: media_type || 'image/jpeg',
+              data: image_base64
+            }
+          },
           { type: 'text', text: prompt }
-        ]}]
-      })
+        ]
+      }]
     });
-    const data = await resp.json();
-    console.log('grok response status:', resp.status, JSON.stringify(data).slice(0, 300));
-    const raw = data.choices?.[0]?.message?.content?.trim() || '';
+    const raw = msg.content?.[0]?.text?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) return res.status(500).json({ error: '無法從回應中提取 JSON', raw, grok_error: data.error || null });
+    if (!match) return res.status(500).json({ error: '無法從回應中提取 JSON', raw });
     const parsed = JSON.parse(match[0]);
     res.json(parsed);
   } catch (err) {
