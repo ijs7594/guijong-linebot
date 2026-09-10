@@ -871,8 +871,9 @@ app.post('/api/parse-daily-report-photo', async (req, res) => {
         ]
       }]
     });
+    console.log('claude vision content:', JSON.stringify(msg.content).slice(0, 400));
+    console.log('claude vision stop_reason:', msg.stop_reason);
     const raw = msg.content?.[0]?.text?.trim() || '';
-    console.log('claude vision raw:', raw.slice(0, 200));
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) return res.status(500).json({ error: '無法從回應中提取 JSON', raw });
     const parsed = JSON.parse(match[0]);
