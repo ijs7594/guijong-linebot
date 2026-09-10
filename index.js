@@ -866,9 +866,10 @@ app.post('/api/parse-daily-report-photo', async (req, res) => {
       })
     });
     const data = await resp.json();
+    console.log('grok response status:', resp.status, JSON.stringify(data).slice(0, 300));
     const raw = data.choices?.[0]?.message?.content?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) return res.status(500).json({ error: '無法從回應中提取 JSON', raw });
+    if (!match) return res.status(500).json({ error: '無法從回應中提取 JSON', raw, grok_error: data.error || null });
     const parsed = JSON.parse(match[0]);
     res.json(parsed);
   } catch (err) {
