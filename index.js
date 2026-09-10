@@ -854,7 +854,7 @@ app.post('/api/parse-daily-report-photo', async (req, res) => {
 注意：day 是號數(1~31)，看不清填 null，只解析有資料的行。`;
   try {
     const msg = await anthropic.messages.create({
-      model: 'claude-sonnet-5',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 2000,
       messages: [{
         role: 'user',
@@ -871,9 +871,8 @@ app.post('/api/parse-daily-report-photo', async (req, res) => {
         ]
       }]
     });
-    console.log('claude vision content:', JSON.stringify(msg.content).slice(0, 400));
-    console.log('claude vision stop_reason:', msg.stop_reason);
-    const raw = msg.content?.[0]?.text?.trim() || '';
+    const textBlock = msg.content?.find(b => b.type === 'text');
+    const raw = textBlock?.text?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) return res.status(500).json({ error: '無法從回應中提取 JSON', raw });
     const parsed = JSON.parse(match[0]);
